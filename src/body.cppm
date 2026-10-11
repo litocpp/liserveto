@@ -76,6 +76,7 @@ public:
     auto requires_input() const -> bool {
         return source_.is_some() && (*source_)->requires_input();
     }
+    auto is_empty() const -> bool { return source_.is_none(); }
     auto poll_next(mut_ref<Body> self, Context& cx) -> Poll<Option<Item>> {
         if (self->source_.is_none()) return Poll<Option<Item>>::Ready(None());
         auto out = (*self->source_)->poll(cx);

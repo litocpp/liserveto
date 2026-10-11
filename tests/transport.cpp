@@ -13,6 +13,8 @@ struct MemoryWire {
     BytesMut output;
     bool     fail_write {};
     bool     pending_read {};
+    usize    partial_write {};
+    int      writes_left { -1 };
 };
 struct MemoryIO {
     rstd::sync::Arc<MemoryWire> state;
@@ -28,11 +30,16 @@ struct MemoryIO {
     }
     auto poll_write(mut_ref<MemoryIO> self, Context&, const Bytes& bytes)
         -> Poll<rstd::io::Result<usize>> {
-        if (self->state->fail_write)
+        if (self->state->fail_write || self->state->writes_left == 0)
             return Poll<rstd::io::Result<usize>>::Ready(Err(rstd::io::error::Error::from_kind(
                 rstd::io::error::ErrorKind { rstd::io::error::ErrorKind::BrokenPipe })));
-        self->state->output.put_slice(bytes.as_slice());
-        return Poll<rstd::io::Result<usize>>::Ready(Ok(bytes.len()));
+        if (self->state->writes_left > 0) --self->state->writes_left;
+        auto count = self->state->partial_write == usize()
+                         ? bytes.len()
+                         : rstd::cmp::min(bytes.len(), self->state->partial_write);
+        self->state->output.put_slice(
+            slice<u8>::from_raw_parts(bytes.as_slice().as_raw_ptr(), count));
+        return Poll<rstd::io::Result<usize>>::Ready(Ok(count));
     }
     auto poll_flush(mut_ref<MemoryIO>, Context&) -> Poll<rstd::io::Result<empty>> {
         return Poll<rstd::io::Result<empty>>::Ready(Ok(empty {}));
@@ -82,6 +89,31 @@ TEST(Transport, WriteFailurePreservesCauseAndClosesConnection) {
     wire->fail_write = true;
     auto runtime     = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
     EXPECT_TRUE(runtime.block_on(failed_write(wire.clone())));
+}
+
+auto owned_memory_connection(int mode) -> rstd::async::coro<bool> {
+    using namespace liserveto;
+    auto wire   = rstd::sync::Arc<MemoryWire>::make();
+    wire->input = Bytes::copy_from_slice(
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"_str.as_bytes());
+    wire->fail_write = mode == 1;
+    int  calls       = 0;
+    auto endpoint    = Endpoint::make([&](Request) -> rstd::async::coro<ResponseResult> {
+        ++calls;
+        co_return Ok(Response {});
+    });
+    auto task        = ConnectionTask::spawn(MemoryIO { wire.clone() },
+                                             rstd::sync::Arc<Endpoint>::make(rstd::move(endpoint)),
+                                             Shutdown::make().unwrap());
+    if (mode == 2) task.abort();
+    auto result = co_await rstd::future::by_ref(task);
+    if (mode == 2) co_return result.is_err() && result.unwrap_err().is_aborted() && calls == 0;
+    co_return result.is_ok() && *result == (mode == 0) && calls == 1;
+}
+TEST(EndpointTransport, ConnectionTaskPreservesResultAndAbortsBeforeFirstPoll) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    for (int mode = 0; mode < 3; ++mode)
+        EXPECT_TRUE(runtime.block_on(owned_memory_connection(mode)));
 }
 
 TEST(EndpointTransport, IncomingTrailersAndUnknownLengthResponseKeepPipelineAlive) {
@@ -311,5 +343,141 @@ TEST(EndpointTransport, IdleDeadlineAndCancellationHaveDistinctCompletionEvents)
         }
         EXPECT_EQ(notified, 1);
         EXPECT_TRUE(polls > 0);
+    }
+}
+
+TEST(Lifecycle, RequestEndsAfterResponseAndKeepsOutcomeForLateObservers) {
+    using namespace liserveto;
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    for (int mode = 0; mode < 3; ++mode) {
+        auto wire   = rstd::sync::Arc<MemoryWire>::make();
+        wire->input = Bytes::copy_from_slice(
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"_str.as_bytes());
+        wire->fail_write = mode == 1;
+        Option<RequestLifetime> lifetime;
+        int                     polls = 0;
+        auto endpoint = Endpoint::make([&](Request request) -> rstd::async::coro<ResponseResult> {
+            lifetime.insert(request.lifetime.clone());
+            EXPECT_TRUE(lifetime->report().is_none());
+            if (mode == 2)
+                co_return Ok(Response::stream(Body::from_stream(ObservedBody { &polls })));
+            auto response = Response::bytes(Bytes::copy_from_slice("ok"_str.as_bytes()));
+            response.on_finish([&](const ResponseReport& report) {
+                EXPECT_TRUE(lifetime->report().is_some());
+                EXPECT_EQ(lifetime->report()->outcome, report.outcome);
+            });
+            co_return Ok(rstd::move(response));
+        });
+        auto run      = serve_connection(MemoryIO { wire.clone() },
+                                         rstd::sync::Arc<Endpoint>::make(rstd::move(endpoint)),
+                                         Shutdown::make().unwrap(),
+                                         {});
+        if (mode == 2) {
+            auto timed =
+                runtime.block_on(rstd::async::timeout(rstd::async::into_future(rstd::move(run)),
+                                                      rstd::time::Duration::from_millis(u64(2))));
+            EXPECT_TRUE(timed.is_err());
+        } else
+            EXPECT_EQ(runtime.block_on(rstd::move(run)), mode == 0);
+        ASSERT_TRUE(lifetime.is_some());
+        auto report = runtime.block_on(lifetime->finished()).unwrap();
+        EXPECT_EQ(report.outcome,
+                  mode == 0   ? ResponseOutcome::Complete
+                  : mode == 1 ? ResponseOutcome::WriteError
+                              : ResponseOutcome::Cancelled);
+        EXPECT_EQ(runtime.block_on(lifetime->finished()).unwrap().outcome, report.outcome);
+    }
+}
+
+TEST(EndpointUpgrade, DelayedActionUsesFinalHeadersAndBufferedBytesAfterKeepAlive) {
+    using namespace liserveto;
+    auto wire   = rstd::sync::Arc<MemoryWire>::make();
+    wire->input = Bytes::copy_from_slice(
+        "GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /upgrade HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: sample\r\n\r\nfirst"_str
+            .as_bytes());
+    int  calls   = 0;
+    auto handler = Endpoint::make([&](Request request) -> rstd::async::coro<ResponseResult> {
+        if (request.target() == "/one"_str) co_return Ok(Response {});
+        auto response =
+            Response::on_upgrade(
+                request.upgrade.take().unwrap(),
+                lihttpto::UpgradeProtocol::make("sample"_str).unwrap(),
+                [&](UpgradedStream stream, auto) -> rstd::async::coro<Result<empty, BodyError>> {
+                    ++calls;
+                    EXPECT_TRUE(rstd::str_::from_utf8(wire->output.as_slice())
+                                    .unwrap()
+                                    .ends_with("X-Final: yes\r\n\r\n"_str));
+                    BytesMut first;
+                    auto     received = co_await rstd::async::io::read(stream, first);
+                    if (received.is_err() || first.as_slice() != "first"_str.as_bytes())
+                        co_return Err(BodyError::Protocol);
+                    co_return Ok(empty {});
+                })
+                .unwrap();
+        EXPECT_EQ(calls, 0);
+        response.head.headers.add("X-Final"_str, "yes"_str).unwrap();
+        co_return Ok(rstd::move(response));
+    });
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    EXPECT_TRUE(
+        runtime.block_on(serve_connection(MemoryIO { wire.clone() },
+                                          rstd::sync::Arc<Endpoint>::make(rstd::move(handler)),
+                                          Shutdown::make().unwrap(),
+                                          {})));
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(
+        rstd::str_::from_utf8(wire->output.as_slice())
+            .unwrap()
+            .contains("Connection: keep-alive\r\n\r\nHTTP/1.1 101 Switching Protocols"_str));
+}
+
+TEST(EndpointUpgrade, DiscardInvalidMetadataAndPartialWriteNeverActivateAction) {
+    using namespace liserveto;
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    for (int mode = 0; mode < 3; ++mode) {
+        auto wire   = rstd::sync::Arc<MemoryWire>::make();
+        wire->input = Bytes::copy_from_slice(
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: sample\r\n\r\n"_str
+                .as_bytes());
+        if (mode == 2) {
+            wire->partial_write = usize(8);
+            wire->writes_left   = 1;
+        }
+        int  calls    = 0;
+        int  discards = 0;
+        auto handler  = Endpoint::make([&](Request request) -> rstd::async::coro<ResponseResult> {
+            auto response =
+                Response::on_upgrade(
+                    request.upgrade.take().unwrap(),
+                    lihttpto::UpgradeProtocol::make("sample"_str).unwrap(),
+                    [&](UpgradedStream, auto) -> rstd::async::coro<Result<empty, BodyError>> {
+                        ++calls;
+                        co_return Ok(empty {});
+                    })
+                    .unwrap();
+            response.on_finish([&](const ResponseReport& report) {
+                EXPECT_EQ(report.outcome,
+                          mode == 0   ? ResponseOutcome::Cancelled
+                          : mode == 1 ? ResponseOutcome::SourceError
+                                      : ResponseOutcome::WriteError);
+                ++discards;
+            });
+            if (mode == 0) {
+                Response replacement;
+                replacement.close_after = true;
+                co_return Ok(rstd::move(replacement));
+            }
+            if (mode == 1) response.head.headers.set("Upgrade"_str, "other"_str).unwrap();
+            co_return Ok(rstd::move(response));
+        });
+        EXPECT_EQ(
+            runtime.block_on(serve_connection(MemoryIO { wire.clone() },
+                                              rstd::sync::Arc<Endpoint>::make(rstd::move(handler)),
+                                              Shutdown::make().unwrap(),
+                                              {})),
+            mode == 0);
+        EXPECT_EQ(calls, 0);
+        EXPECT_EQ(discards, 1);
+        if (mode == 2) EXPECT_EQ(wire->output.len(), usize(8));
     }
 }

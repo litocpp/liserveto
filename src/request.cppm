@@ -20,14 +20,20 @@ class Request {
 
 public:
     Shutdown                      shutdown;
+    RequestLifetime               lifetime;
+    Option<UpgradePermit>         upgrade;
     Option<rstd::net::SocketAddr> peer;
     Request(lihttpto::RequestHead         head,
             IncomingBody                  body,
             Shutdown                      stop,
-            Option<rstd::net::SocketAddr> peer = {})
+            Option<rstd::net::SocketAddr> peer     = {},
+            RequestLifetime               lifetime = {},
+            Option<UpgradePermit>         upgrade  = {})
         : body_(Some(rstd::move(body))),
           head_(rstd::move(head)),
           shutdown(rstd::move(stop)),
+          lifetime(rstd::move(lifetime)),
+          upgrade(rstd::move(upgrade)),
           peer(peer) {}
     Request(const Request&)                        = delete;
     Request(Request&&) noexcept                    = default;

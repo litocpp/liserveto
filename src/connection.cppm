@@ -82,9 +82,9 @@ class BasicConnection;
 class PreparedUpgrade {
     template<typename>
     friend class BasicConnection;
-    rstd::sync::Arc<empty> identity_;
-    rstd::bytes::Bytes     response_;
-    PreparedUpgrade(rstd::sync::Arc<empty> identity, rstd::bytes::Bytes response)
+    rstd::sync::Arc<UpgradeOffer> identity_;
+    rstd::bytes::Bytes            response_;
+    PreparedUpgrade(rstd::sync::Arc<UpgradeOffer> identity, rstd::bytes::Bytes response)
         : identity_(rstd::move(identity)), response_(rstd::move(response)) {}
 
 public:
@@ -117,8 +117,7 @@ class BasicConnection {
     ConnectionLimits      limits_;
     rstd::bytes::BytesMut buffer_ { rstd::bytes::BytesMut::with_capacity(usize(8192)) };
     Option<alloc::boxed::Box<RequestBodyDecoder>> body_;
-    Option<UpgradeOffer>                          upgrade_;
-    Option<rstd::sync::Arc<empty>>                upgrade_identity_;
+    Option<rstd::sync::Arc<UpgradeOffer>>         upgrade_;
     UpgradeError                                  upgrade_error_ { UpgradeError::InvalidRequest };
     String                                        method_;
     Version                                       version_ { Version::Http11 };
@@ -215,12 +214,11 @@ public:
             if (progress.is_err()) co_return Err(decode_error(progress.unwrap_err()));
             buffer_.advance(progress->consumed);
             if (progress->status != DecodeStatus::Complete) continue;
-            auto head         = decoder.take().unwrap();
-            auto offer        = UpgradeOffer::parse(head);
-            upgrade_          = None();
-            upgrade_identity_ = None();
+            auto head  = decoder.take().unwrap();
+            auto offer = UpgradeOffer::parse(head);
+            upgrade_   = None();
             if (offer.is_ok())
-                upgrade_ = Some(rstd::move(offer).unwrap());
+                upgrade_ = Some(rstd::sync::Arc<UpgradeOffer>::make(rstd::move(offer).unwrap()));
             else
                 upgrade_error_ = offer.unwrap_err();
             auto expectation = request_expectation(head);
@@ -311,16 +309,19 @@ public:
         -> Result<PreparedUpgrade, UpgradeError> {
         if (state_ != State::Ready) return Err(UpgradeError::InvalidRequest);
         if (upgrade_.is_none()) return Err(upgrade_error_);
-        auto response = upgrade_->response(protocol, headers, limits_.head.total_bytes);
+        auto response = (*upgrade_)->response(protocol, headers, limits_.head.total_bytes);
         if (response.is_err()) return Err(response.unwrap_err());
-        if (upgrade_identity_.is_none()) upgrade_identity_ = Some(rstd::sync::Arc<empty>::make());
-        return Ok(PreparedUpgrade { upgrade_identity_->clone(), rstd::move(response).unwrap() });
+        return Ok(PreparedUpgrade { upgrade_->clone(), rstd::move(response).unwrap() });
+    }
+    auto upgrade_permit() const -> Option<UpgradePermit> {
+        if (state_ != State::Ready || upgrade_.is_none()) return None();
+        return Some(UpgradePermit(upgrade_->clone()));
     }
 
     auto upgrade(PreparedUpgrade prepared)
         -> rstd::async::coro<Result<UpgradedIO<IO>, ConnectionError>> {
-        if (state_ != State::Ready || upgrade_identity_.is_none() ||
-            ! rstd::sync::Arc<empty>::ptr_eq(prepared.identity_, *upgrade_identity_))
+        if (state_ != State::Ready || upgrade_.is_none() ||
+            ! rstd::sync::Arc<UpgradeOffer>::ptr_eq(prepared.identity_, *upgrade_))
             co_return Err(connection_error(ConnectionErrorKind::State));
         state_ = State::Writing;
         Operation operation { *this };
@@ -332,7 +333,6 @@ public:
         buffer_.clear();
         body_              = None();
         upgrade_           = None();
-        upgrade_identity_  = None();
         state_             = State::Upgraded;
         operation.complete = true;
         co_return Ok(UpgradedIO<IO> { stream_.take().unwrap(), rstd::move(pending) });
@@ -361,8 +361,60 @@ public:
         co_return Ok(empty {});
     }
 
-    auto send(liserveto::Response response) -> rstd::async::coro<Result<empty, ConnectionError>> {
+    auto
+    send(liserveto::Response                response,
+         rstd::sync::Arc<ConnectionCleanup> cleanup = rstd::sync::Arc<ConnectionCleanup>::make())
+        -> rstd::async::coro<Result<empty, ConnectionError>> {
         ResponseTransfer transfer { response };
+        if (response.upgrade_.is_some()) {
+            auto plan = response.upgrade_.take().unwrap();
+            if (state_ != State::Ready || upgrade_.is_none() ||
+                ! rstd::sync::Arc<UpgradeOffer>::ptr_eq(plan.permit.offer_, *upgrade_) ||
+                ! response.body.is_empty() || response.content_length.is_some() ||
+                response.close_after) {
+                close();
+                transfer.finish(ResponseOutcome::SourceError);
+                co_return Err(connection_error(ConnectionErrorKind::State));
+            }
+            auto head = (*upgrade_)->encode_response(
+                plan.protocol, response.head, limits_.head.total_bytes);
+            if (head.is_err()) {
+                close();
+                transfer.finish(ResponseOutcome::SourceError);
+                co_return Err(connection_error(ConnectionErrorKind::State));
+            }
+            state_ = State::Writing;
+            Operation operation { *this };
+            auto      written = co_await write_with_deadline(
+                *stream_, *head, transfer.started, limits_.write_timeout);
+            if (written.is_err()) {
+                close();
+                transfer.finish(written.unwrap_err().kind == ResponseError::Timeout
+                                    ? ResponseOutcome::Timeout
+                                    : ResponseOutcome::WriteError);
+                co_return Err(response_error(rstd::move(written).unwrap_err()));
+            }
+            auto pending = rstd::bytes::Bytes::copy_from_slice(buffer_.as_slice());
+            buffer_.clear();
+            body_              = None();
+            upgrade_           = None();
+            auto upgraded      = UpgradedStream::make(stream_.take().unwrap(), rstd::move(pending));
+            state_             = State::Upgraded;
+            operation.complete = true;
+            auto action        = Some(rstd::move(plan.action));
+            auto result        = co_await (*action)->run(rstd::move(upgraded), cleanup.clone());
+            action             = None();
+            if (result.is_err()) {
+                auto error = result.unwrap_err();
+                transfer.finish(error == BodyError::Timeout     ? ResponseOutcome::Timeout
+                                : error == BodyError::Cancelled ? ResponseOutcome::Cancelled
+                                                                : ResponseOutcome::SourceError);
+                co_return Err(
+                    ConnectionError { ConnectionErrorKind::Body, {}, {}, {}, Some(error) });
+            }
+            transfer.finish(ResponseOutcome::Complete);
+            co_return Ok(empty {});
+        }
         if ((state_ != State::Ready && state_ != State::Body) || response.body.requires_input()) {
             close();
             transfer.finish(ResponseOutcome::SourceError);
@@ -382,7 +434,13 @@ public:
             transfer.finish(ResponseOutcome::SourceError);
             co_return Err(response_error({ made.unwrap_err(), None() }));
         }
-        auto encoder      = rstd::move(made).unwrap();
+        auto encoder              = rstd::move(made).unwrap();
+        auto stream_write_timeout = response.write_timeout.is_some() ? response.write_timeout
+                                                                     : limits_.stream_write_timeout;
+        if (response.long_lived && stream_write_timeout.is_none())
+            stream_write_timeout = Some(limits_.write_timeout);
+        auto stream_idle_timeout =
+            response.idle_timeout.is_some() ? response.idle_timeout : limits_.stream_idle_timeout;
         state_            = State::Writing;
         continue_pending_ = false;
         Operation operation { *this };
@@ -390,6 +448,7 @@ public:
         auto      written =
             co_await write_with_deadline(*stream_, head, transfer.started, limits_.write_timeout);
         if (written.is_err()) {
+            close();
             transfer.finish(written.unwrap_err().kind == ResponseError::Timeout
                                 ? ResponseOutcome::Timeout
                                 : ResponseOutcome::WriteError);
@@ -403,8 +462,8 @@ public:
                     co_await rstd::async::yield_now();
                 }
                 auto next = [&]() -> rstd::async::coro<Result<Option<BodyItem>, ConnectionError>> {
-                    auto idle = limits_.stream_idle_timeout;
-                    if (idle.is_none() && limits_.stream_write_timeout.is_none()) {
+                    auto idle = stream_idle_timeout;
+                    if (idle.is_none() && stream_write_timeout.is_none()) {
                         auto elapsed = transfer.started.elapsed();
                         if (elapsed >= limits_.write_timeout)
                             co_return Err(connection_error(ConnectionErrorKind::Timeout));
@@ -419,6 +478,7 @@ public:
                 };
                 auto part = co_await next();
                 if (part.is_err()) {
+                    close();
                     transfer.finish(ResponseOutcome::Timeout);
                     co_return Err(rstd::move(part).unwrap_err());
                 }
@@ -427,8 +487,10 @@ public:
                 auto frame = item.take().unwrap();
                 if (frame.is_err()) {
                     auto error = frame.unwrap_err();
-                    transfer.finish(error == BodyError::Timeout ? ResponseOutcome::Timeout
-                                                                : ResponseOutcome::SourceError);
+                    close();
+                    transfer.finish(error == BodyError::Timeout     ? ResponseOutcome::Timeout
+                                    : error == BodyError::Cancelled ? ResponseOutcome::Cancelled
+                                                                    : ResponseOutcome::SourceError);
                     co_return Err(ConnectionError {
                         ConnectionErrorKind::Body, None(), None(), None(), Some(error) });
                 }
@@ -436,16 +498,17 @@ public:
                 if (frame->is_Data()) payload = u64(frame->as_Data().bytes.len().to_primitive());
                 auto encoded = encoder.encode(rstd::move(frame).unwrap());
                 if (encoded.is_err()) {
+                    close();
                     transfer.finish(ResponseOutcome::SourceError);
                     co_return Err(response_error({ encoded.unwrap_err(), None() }));
                 }
-                auto started = limits_.stream_write_timeout.is_some() ? rstd::time::Instant::now()
-                                                                      : transfer.started;
-                auto timeout = limits_.stream_write_timeout.is_some()
-                                   ? *limits_.stream_write_timeout
-                                   : limits_.write_timeout;
-                auto output  = co_await write_with_deadline(*stream_, *encoded, started, timeout);
+                auto started =
+                    stream_write_timeout.is_some() ? rstd::time::Instant::now() : transfer.started;
+                auto timeout =
+                    stream_write_timeout.is_some() ? *stream_write_timeout : limits_.write_timeout;
+                auto output = co_await write_with_deadline(*stream_, *encoded, started, timeout);
                 if (output.is_err()) {
+                    close();
                     transfer.finish(output.unwrap_err().kind == ResponseError::Timeout
                                         ? ResponseOutcome::Timeout
                                         : ResponseOutcome::WriteError);
@@ -455,16 +518,18 @@ public:
             }
         auto tail = encoder.finish();
         if (tail.is_err()) {
+            close();
             transfer.finish(ResponseOutcome::SourceError);
             co_return Err(response_error({ tail.unwrap_err(), None() }));
         }
         if (! tail->is_empty()) {
-            auto started = limits_.stream_write_timeout.is_some() ? rstd::time::Instant::now()
-                                                                  : transfer.started;
-            auto timeout = limits_.stream_write_timeout.is_some() ? *limits_.stream_write_timeout
-                                                                  : limits_.write_timeout;
-            auto output  = co_await write_with_deadline(*stream_, *tail, started, timeout);
+            auto started =
+                stream_write_timeout.is_some() ? rstd::time::Instant::now() : transfer.started;
+            auto timeout =
+                stream_write_timeout.is_some() ? *stream_write_timeout : limits_.write_timeout;
+            auto output = co_await write_with_deadline(*stream_, *tail, started, timeout);
             if (output.is_err()) {
+                close();
                 transfer.finish(output.unwrap_err().kind == ResponseError::Timeout
                                     ? ResponseOutcome::Timeout
                                     : ResponseOutcome::WriteError);

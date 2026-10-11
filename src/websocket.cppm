@@ -2,6 +2,8 @@ module;
 #ifdef LITO_FEAT_WEBSOCKET
 export module liserveto:websocket;
 export import :connection;
+export import :request;
+export import :shutdown;
 export import liwebsocketo;
 using namespace rstd::prelude;
 using namespace liwebsocketo;
@@ -107,6 +109,132 @@ public:
         if (driver.is_err())
             co_return Err(ServerConnectFailure { .connection = Some(driver.unwrap_err()) });
         co_return Ok(ServerConnection(rstd::move(driver).unwrap()));
+    }
+};
+} // namespace liserveto
+
+struct UpgradedTransport {
+    liserveto::UpgradedStream stream;
+    liserveto::Shutdown       cancelled;
+    rstd::time::Duration      timeout;
+    auto                      read() -> coro<WebSocketResult<Bytes>> {
+        if (cancelled.requested()) co_return Err(WebSocketError::Cancelled);
+        auto bytes  = BytesMut::with_capacity(usize(16384));
+        auto result = co_await rstd::async::timeout(
+            rstd::async::select(cancelled.notified(), rstd::async::io::read(stream, bytes)),
+            timeout);
+        if (result.is_err()) co_return Err(WebSocketError::Timeout);
+        auto selected = rstd::move(result).unwrap();
+        if (selected.is_left()) co_return Err(WebSocketError::Cancelled);
+        if (rstd::move(selected).unwrap_right().is_err()) co_return Err(WebSocketError::Transport);
+        co_return Ok(bytes.freeze());
+    }
+    auto write(Bytes bytes) -> coro<WebSocketResult<usize>> {
+        if (cancelled.requested()) co_return Err(WebSocketError::Cancelled);
+        auto result = co_await rstd::async::timeout(
+            rstd::async::select(cancelled.notified(), rstd::async::io::write_all(stream, bytes)),
+            timeout);
+        if (result.is_err()) co_return Err(WebSocketError::Timeout);
+        auto selected = rstd::move(result).unwrap();
+        if (selected.is_left()) co_return Err(WebSocketError::Cancelled);
+        if (rstd::move(selected).unwrap_right().is_err()) co_return Err(WebSocketError::Transport);
+        co_return Ok(bytes.len());
+    }
+    void cancel() { (void)cancelled.request_stop(); }
+};
+
+export namespace liserveto
+{
+class WebSocket : public WebSocketConnection<UpgradedTransport> {
+    using Driver = WebSocketConnection<UpgradedTransport>;
+    rstd::sync::Arc<ConnectionCleanup> cleanup_;
+    friend class WebSocketUpgrade;
+    WebSocket(Driver driver, rstd::sync::Arc<ConnectionCleanup> cleanup)
+        : Driver(rstd::move(driver)), cleanup_(rstd::move(cleanup)) {}
+
+public:
+    WebSocket(WebSocket&&) noexcept = default;
+    ~WebSocket() {
+        if (cleanup_) cleanup_->defer(rstd::move(static_cast<Driver&>(*this)).into_shutdown());
+    }
+};
+class WebSocketUpgrade {
+    UpgradePermit   permit_;
+    ServerHandshake handshake_;
+    Shutdown        shutdown_;
+    RequestLifetime lifetime_;
+    WebSocketUpgrade(UpgradePermit   permit,
+                     ServerHandshake handshake,
+                     Shutdown        shutdown,
+                     RequestLifetime lifetime)
+        : permit_(rstd::move(permit)),
+          handshake_(rstd::move(handshake)),
+          shutdown_(rstd::move(shutdown)),
+          lifetime_(rstd::move(lifetime)) {}
+
+public:
+    static auto from_request(const Request& request, Option<ref<str>> protocol = {})
+        -> Result<WebSocketUpgrade, HandshakeError> {
+        if (request.upgrade.is_none()) return Err(HandshakeError::Upgrade);
+        auto handshake = ServerHandshake::parse(request.head(), protocol);
+        if (handshake.is_err()) return Err(handshake.unwrap_err());
+        return Ok(WebSocketUpgrade(request.upgrade->clone(),
+                                   rstd::move(handshake).unwrap(),
+                                   request.shutdown.clone(),
+                                   request.lifetime.clone()));
+    }
+    template<class H>
+    auto accept(H                    handler,
+                WebSocketOptions     options    = {},
+                rstd::time::Duration io_timeout = rstd::time::Duration::from_secs(
+                    u64(30))) && -> Result<Response, HandshakeError> {
+        if (io_timeout.is_zero() || options.receive_messages == usize() ||
+            options.receive_bytes == usize())
+            return Err(HandshakeError::Upgrade);
+        auto action = [handler = rstd::move(handler),
+                       options,
+                       io_timeout,
+                       protocol = handshake_.protocol().clone(),
+                       shutdown = shutdown_.clone(),
+                       lifetime = lifetime_.clone()](
+                          UpgradedStream stream, rstd::sync::Arc<ConnectionCleanup> cleanup) mutable
+            -> coro<Result<empty, BodyError>> {
+            auto driver = WebSocketConnection<UpgradedTransport>::start(
+                UpgradedTransport { rstd::move(stream), Shutdown::make().unwrap(), io_timeout },
+                Role::Server,
+                options,
+                rstd::move(protocol));
+            if (driver.is_err()) co_return Err(BodyError::Io);
+            WebSocket socket(rstd::move(driver).unwrap(), rstd::move(cleanup));
+            auto      invoke = [&]() -> coro<Result<empty, BodyError>> {
+                co_return co_await handler(socket, shutdown.clone(), lifetime.clone());
+            };
+            auto pending = Some(rstd::async::into_future(invoke()));
+            auto selected =
+                co_await rstd::async::select(shutdown.notified(), rstd::future::by_ref(*pending));
+            Result<empty, BodyError> result = Err(BodyError::Cancelled);
+            if (selected.is_right())
+                result = rstd::move(selected).unwrap_right();
+            else {
+                auto closing = socket.close();
+                auto waited  = co_await rstd::async::timeout(
+                    rstd::async::select(rstd::future::by_ref(closing),
+                                        rstd::future::by_ref(*pending)),
+                    options.close_timeout);
+                if (waited.is_ok() && waited->is_right())
+                    result = rstd::move(*waited).unwrap_right();
+            }
+            pending = None();
+            co_await socket.shutdown();
+            co_return result;
+        };
+        auto response =
+            Response::on_upgrade(rstd::move(permit_),
+                                 lihttpto::UpgradeProtocol::make("websocket"_str).unwrap(),
+                                 rstd::move(action),
+                                 handshake_.headers());
+        if (response.is_err()) return Err(HandshakeError::Upgrade);
+        return Ok(rstd::move(response).unwrap());
     }
 };
 } // namespace liserveto
