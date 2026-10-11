@@ -1,11 +1,11 @@
 module;
 #include <rstd/macro.hpp>
-export module libserveto:response_io;
+export module liserveto:response_io;
 export import lihttpto;
 using namespace rstd::prelude;
 using namespace lihttpto;
 using IoError = rstd::io::error::Error;
-export namespace libserveto
+export namespace liserveto
 {
 template<typename IO>
 auto write_with_deadline(IO&                       stream,
@@ -25,12 +25,12 @@ auto write_with_deadline(IO&                       stream,
     co_return Ok(empty {});
 }
 template<typename IO>
-auto write_response(IO&                  stream,
-                    const Response&      response,
-                    ref<str>             request_method,
-                    Version              version,
-                    bool                 keep_alive = false,
-                    rstd::time::Duration budget     = rstd::time::Duration::from_secs(u64(30)))
+auto write_response(IO&                       stream,
+                    const lihttpto::Response& response,
+                    ref<str>                  request_method,
+                    Version                   version,
+                    bool                      keep_alive = false,
+                    rstd::time::Duration      budget     = rstd::time::Duration::from_secs(u64(30)))
     -> rstd::async::coro<Result<empty, ResponseWriteError>> {
     auto head = encode_response_head(response, request_method, version, keep_alive);
     if (head.is_err()) co_return Err(ResponseWriteError { head.unwrap_err(), None() });
@@ -42,4 +42,4 @@ auto write_response(IO&                  stream,
     }
     co_return Ok(empty {});
 }
-} // namespace libserveto
+} // namespace liserveto

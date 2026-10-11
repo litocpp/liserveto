@@ -7,25 +7,26 @@ module;
 #include <unistd.h>
 #if __has_include(<linux/openat2.h>) && defined(SYS_openat2)
 #include <linux/openat2.h>
-#define LIBSERVETO_HAS_OPENAT2 1
+#define liserveto_HAS_OPENAT2 1
 #endif
 #endif
 
-module libserveto;
+module liserveto;
 import :static_files.confined_dir;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
-using rstd::io::error::Error;
-using rstd::io::error::ErrorKind;
+using IoError     = rstd::io::error::Error;
+using IoErrorKind = rstd::io::error::ErrorKind;
 using rstd::os::fd::OwnedFd;
 using rstd::path::Path;
 
 auto open_confined_at(const rstd::fs::Dir& directory, ref<Path> path, bool child_directory)
     -> rstd::io::Result<OwnedFd> {
-#ifdef LIBSERVETO_HAS_OPENAT2
+#ifdef liserveto_HAS_OPENAT2
     auto converted = path.to_cstring();
-    if (converted.is_err()) return Err(Error::from_kind(ErrorKind { ErrorKind::InvalidInput }));
+    if (converted.is_err())
+        return Err(IoError::from_kind(IoErrorKind { IoErrorKind::InvalidInput }));
     auto       value = rstd::move(converted).unwrap();
     ::open_how how {};
     how.flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
@@ -35,21 +36,22 @@ auto open_confined_at(const rstd::fs::Dir& directory, ref<Path> path, bool child
         auto raw = ::syscall(SYS_openat2, directory.as_raw_fd(), value.as_ptr(), &how, sizeof(how));
         if (raw >= 0) return Ok(OwnedFd::from_raw_fd(static_cast<int>(raw)));
         auto error = errno;
-        if (error == ENOSYS) return Err(Error::from_kind(ErrorKind { ErrorKind::Unsupported }));
-        if (error != EINTR) return Err(Error::from_raw_os_error(i32(error)));
+        if (error == ENOSYS)
+            return Err(IoError::from_kind(IoErrorKind { IoErrorKind::Unsupported }));
+        if (error != EINTR) return Err(IoError::from_raw_os_error(i32(error)));
     }
 #else
     (void)directory;
     (void)path;
     (void)child_directory;
-    return Err(Error::from_kind(ErrorKind { ErrorKind::Unsupported }));
+    return Err(IoError::from_kind(IoErrorKind { IoErrorKind::Unsupported }));
 #endif
 }
 
-namespace libserveto
+namespace liserveto
 {
 auto ConfinedDir::open(ref<Path> path) -> rstd::io::Result<ConfinedDir> {
-#ifdef LIBSERVETO_HAS_OPENAT2
+#ifdef liserveto_HAS_OPENAT2
     auto root = rstd_try(rstd::fs::Dir::open_with(
         path, rstd::fs::OpenOptions::make().read(true).custom_flags(i32(O_NOFOLLOW))));
     // Verify the required kernel constraints before granting the directory capability.
@@ -57,18 +59,18 @@ auto ConfinedDir::open(ref<Path> path) -> rstd::io::Result<ConfinedDir> {
     return Ok(ConfinedDir(rstd::fs::Dir::from_raw_fd(rstd::move(fd).into_raw_fd())));
 #else
     (void)path;
-    return Err(Error::from_kind(ErrorKind { ErrorKind::Unsupported }));
+    return Err(IoError::from_kind(IoErrorKind { IoErrorKind::Unsupported }));
 #endif
 }
 auto ConfinedDir::open_file(ref<Path> path) const -> rstd::io::Result<rstd::fs::File> {
     auto fd   = rstd_try(open_confined_at(directory_, path, false));
     auto file = rstd::fs::File(rstd::move(fd));
     auto info = rstd_try(file.metadata());
-    if (! info.is_file()) return Err(Error::from_kind(ErrorKind { ErrorKind::InvalidInput }));
+    if (! info.is_file()) return Err(IoError::from_kind(IoErrorKind { IoErrorKind::InvalidInput }));
     return Ok(rstd::move(file));
 }
 auto ConfinedDir::open_dir(ref<Path> path) const -> rstd::io::Result<ConfinedDir> {
     auto fd = rstd_try(open_confined_at(directory_, path, true));
     return Ok(ConfinedDir(rstd::fs::Dir::from_raw_fd(rstd::move(fd).into_raw_fd())));
 }
-} // namespace libserveto
+} // namespace liserveto

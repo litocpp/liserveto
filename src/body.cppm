@@ -1,4 +1,4 @@
-export module libserveto:body;
+export module liserveto:body;
 export import lihttpto;
 export import rstd;
 
@@ -7,7 +7,7 @@ using rstd::bytes::Bytes;
 using rstd::task::Context;
 using rstd::task::Poll;
 
-export namespace libserveto
+export namespace liserveto
 {
 enum class BodyError
 {
@@ -15,16 +15,17 @@ enum class BodyError
     Protocol,
     LimitExceeded,
     Cancelled,
-    Io
+    Io,
+    Timeout
 };
 using BodyItem = Result<lihttpto::BodyFrame, BodyError>;
 struct CollectedBody {
     Bytes             data;
     lihttpto::Headers trailers;
 };
-} // namespace libserveto
+} // namespace liserveto
 
-namespace libserveto
+namespace liserveto
 {
 // Erase only the stored source; all progression uses the public Stream protocol.
 struct BodyPoll {
@@ -32,18 +33,23 @@ struct BodyPoll {
     struct Api {
         using Trait = BodyPoll;
         auto poll(Context& cx) -> Poll<Option<BodyItem>> { return rstd::trait_call<0>(this, cx); }
+        auto requires_input() const -> bool { return rstd::trait_call<1>(this); }
     };
     template<typename S>
-    using Funcs = TraitFuncs<&S::poll>;
+    using Funcs = TraitFuncs<&S::poll, &S::requires_input>;
 };
 template<rstd::stream::Source S>
 struct StoredBody {
     S    source;
     auto poll(Context& cx) -> Poll<Option<BodyItem>> { return rstd::future::poll_next(source, cx); }
+    auto requires_input() const -> bool {
+        if constexpr (requires { source.requires_input(); }) return source.requires_input();
+        return false;
+    }
 };
-} // namespace libserveto
+} // namespace liserveto
 
-export namespace libserveto
+export namespace liserveto
 {
 class Body {
     Option<Box<dyn<BodyPoll>>> source_;
@@ -66,6 +72,9 @@ public:
     static auto from_bytes(Bytes bytes) -> Body {
         return from_stream(
             rstd::stream::once(Item(Ok(lihttpto::BodyFrame::Data(rstd::move(bytes))))));
+    }
+    auto requires_input() const -> bool {
+        return source_.is_some() && (*source_)->requires_input();
     }
     auto poll_next(mut_ref<Body> self, Context& cx) -> Poll<Option<Item>> {
         if (self->source_.is_none()) return Poll<Option<Item>>::Ready(None());
@@ -114,4 +123,4 @@ public:
         }
     }
 };
-} // namespace libserveto
+} // namespace liserveto

@@ -1,9 +1,9 @@
 #include <rstd/test/gtest.hpp>
-import libserveto;
+import liserveto;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
-using namespace libserveto;
+using namespace liserveto;
 using lihttpto::BodyFrame;
 
 auto chunk(ref<str> text) -> BodyItem {

@@ -1,7 +1,8 @@
 module;
 #include <rstd/macro.hpp>
-export module libserveto:server;
+export module liserveto:server;
 export import :connection;
+export import :endpoint;
 
 using namespace rstd::prelude;
 using namespace lihttpto;
@@ -12,36 +13,8 @@ using IoError     = rstd::io::error::Error;
 using IoErrorKind = rstd::io::error::ErrorKind;
 using rstd::async::AbortOnDropHandle;
 
-namespace libserveto
+export namespace liserveto
 {
-struct ServerAccess;
-struct ShutdownState {
-    AtomicBool          requested { false };
-    AtomicBool          used { false };
-    rstd::async::Notify notification;
-    explicit ShutdownState(rstd::async::Notify value): notification(rstd::move(value)) {}
-};
-} // namespace libserveto
-
-export namespace libserveto
-{
-class Shutdown {
-    friend struct ServerAccess;
-    Arc<ShutdownState> state_;
-    explicit Shutdown(Arc<ShutdownState> state): state_(rstd::move(state)) {}
-
-public:
-    static auto make() -> Result<Shutdown, IoError> {
-        auto notification = rstd_try(rstd::async::Notify::make());
-        return Ok(Shutdown { Arc<ShutdownState>::make(rstd::move(notification)) });
-    }
-    auto clone() const -> Shutdown { return Shutdown { state_.clone() }; }
-    auto request_stop() const -> Result<empty, IoError> {
-        state_->requested.store(true, Ordering::Release);
-        return state_->notification.notifier().notify();
-    }
-    auto requested() const -> bool { return state_->requested.load(Ordering::Acquire); }
-};
 struct ServerLimits {
     ConnectionLimits     connection;
     usize                connections { 128 };
@@ -52,9 +25,9 @@ struct ServerReport {
     usize failed {};
     usize cancelled {};
 };
-} // namespace libserveto
+} // namespace liserveto
 
-namespace libserveto
+namespace liserveto
 {
 struct ServerAccess {
     static auto notified(const Shutdown& shutdown) -> rstd::async::NotifyFuture {
@@ -96,25 +69,53 @@ void record_completion(ServerReport& report, ConnectionCompletion result) {
         ++report.failed;
 }
 export template<typename IO, typename Handler>
-auto serve_connection(IO stream, Arc<Handler> handler, Shutdown shutdown, ConnectionLimits limits)
-    -> rstd::async::coro<bool> {
-    BasicConnection<IO> connection(rstd::move(stream), limits);
+auto serve_connection(IO                            stream,
+                      Arc<Handler>                  handler,
+                      Shutdown                      shutdown,
+                      ConnectionLimits              limits,
+                      Option<rstd::net::SocketAddr> peer = {}) -> rstd::async::coro<bool> {
+    auto connection = Arc<BasicConnection<IO>>::make(rstd::move(stream), limits);
+    struct CloseOnExit {
+        Arc<BasicConnection<IO>> connection;
+        ~CloseOnExit() { connection->close(); }
+    } close_on_exit { connection.clone() };
     while (! shutdown.requested()) {
-        auto request = co_await connection.read_request();
+        auto request = co_await connection->read_request();
         if (request.is_err()) co_return false;
         if (request->is_none()) co_return true;
         if (shutdown.requested()) co_return true;
-        auto head    = rstd::move(*request).unwrap();
-        auto handled = co_await (*handler)(connection, head, shutdown);
-        if (handled.is_err()) co_return false;
-        if (connection.is_closed() || connection.is_upgraded()) co_return true;
-        if (! connection.ready_for_request()) co_return false;
+        auto head = rstd::move(*request).unwrap();
+        if constexpr (requires { handler->call(rstd::declval<Request>()); }) {
+            auto incoming = IncomingBody::from_connection(connection.clone());
+            auto scope    = incoming.scope();
+            auto response = co_await handler->call(
+                Request(rstd::move(head), rstd::move(incoming), shutdown.clone(), peer));
+            scope.expire();
+            if (response.is_err()) {
+                liserveto::Response rejection;
+                const auto&         error = response.unwrap_err();
+                auto                status =
+                    error.kind == ErrorKind::InvalidRequest ? u16(400)
+                    : error.kind == ErrorKind::Body && error.body == Some(BodyError::LimitExceeded)
+                        ? u16(413)
+                        : u16(500);
+                rejection.head.status = lihttpto::StatusCode::make(status).unwrap();
+                rejection.close_after = true;
+                if ((co_await connection->send(rstd::move(rejection))).is_err()) co_return false;
+            } else if ((co_await connection->send(rstd::move(response).unwrap())).is_err())
+                co_return false;
+        } else {
+            auto handled = co_await (*handler)(*connection, head, shutdown);
+            if (handled.is_err()) co_return false;
+        }
+        if (connection->is_closed() || connection->is_upgraded()) co_return true;
+        if (! connection->ready_for_request()) co_return false;
     }
     co_return true;
 }
-} // namespace libserveto
+} // namespace liserveto
 
-export namespace libserveto
+export namespace liserveto
 {
 // Handler and its shared state must support concurrent calls and cooperative
 // cancellation.
@@ -180,7 +181,8 @@ auto serve(rstd::net::TcpListener listener,
                 rstd::async::spawn(serve_connection(rstd::move(pair.template get<0>()),
                                                     handler.clone(),
                                                     shutdown.clone(),
-                                                    limits.connection)) });
+                                                    limits.connection,
+                                                    Some(pair.template get<1>()))) });
             ++active;
             ++report.accepted;
             break;
@@ -207,4 +209,4 @@ auto serve(rstd::net::TcpListener listener,
     if (failure.is_some()) co_return Err(rstd::move(*failure));
     co_return Ok(report);
 }
-} // namespace libserveto
+} // namespace liserveto

@@ -1,29 +1,33 @@
 [package]
-name = "libserveto"
+name = "liserveto"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
 authors = ["hypengw <hypengwip@gmail.com>"]
 
 [lib]
-name = "libserveto"
-module = "libserveto"
-archive = "libserveto"
+name = "liserveto"
+module = "liserveto"
+archive = "liserveto"
 
 [features.websocket]
 default = false
 
+[features.json]
+default = false
+
 [dependencies]
-lihttpto = { path = "../lihttpto", pub = true }
+lihttpto = { version = "0.1.0", pub = true }
 rstd-std = { version = "0.1.7", pub = true }
-liwebsocketo = { path = "../liwebsocketo", pub = true, condition = "feature.websocket" }
+liwebsocketo = { version = "0.1.0", pub = true, condition = "feature.websocket" }
+rstd-json = { version = "0.1.7", pub = true, condition = "feature.json" }
 
 [dev-dependencies]
 rstd-test = { version = "0.1.7" }
 rstd-nostd = { version = "0.1.7", usage = "link" }
 
 [[test]]
-name = "libserveto-tests"
-sources = ["tests/main.cpp", "tests/body.cpp", "tests/connection.cpp", "tests/server.cpp", "tests/response.cpp", "tests/websocket.cpp", "tests/transport.cpp", "tests/confined_dir.cpp"]
+name = "liserveto-tests"
+sources = ["tests/main.cpp", "tests/body.cpp", "tests/connection.cpp", "tests/server.cpp", "tests/response.cpp", "tests/websocket.cpp", "tests/transport.cpp", "tests/confined_dir.cpp", "tests/endpoint.cpp", "tests/router.cpp", "tests/json.cpp"]
 link-stdlib = false
 
 [profile.base]

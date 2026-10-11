@@ -1,9 +1,9 @@
-export module libserveto:static_files.confined_dir;
+export module liserveto:static_files.confined_dir;
 export import rstd;
 
 using namespace rstd::prelude;
 
-export namespace libserveto
+export namespace liserveto
 {
 // Read-only opens beneath a trusted root handle; no symlink resolution in relative paths.
 // Unsupported backends fail closed. This does not provide a content snapshot.
@@ -27,4 +27,4 @@ public:
         });
     }
 };
-} // namespace libserveto
+} // namespace liserveto

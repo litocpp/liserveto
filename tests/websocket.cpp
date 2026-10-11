@@ -1,10 +1,10 @@
 #ifdef LITO_FEAT_WEBSOCKET
 #include <rstd/test/gtest.hpp>
-import libserveto;
+import liserveto;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace liwebsocketo;
-using namespace libserveto;
+using namespace liserveto;
 using rstd::async::coro;
 using rstd::bytes::Bytes;
 using rstd::bytes::BytesMut;
@@ -12,9 +12,9 @@ using rstd::bytes::BytesMut;
 static auto serve_one(rstd::net::TcpListener& listener) -> coro<bool> {
     auto accepted = co_await listener.accept();
     if (accepted.is_err()) co_return false;
-    auto                   pair = rstd::move(accepted).unwrap();
-    libserveto::Connection http(rstd::move(pair.template get<0>()));
-    auto                   request = co_await http.read_request();
+    auto                  pair = rstd::move(accepted).unwrap();
+    liserveto::Connection http(rstd::move(pair.template get<0>()));
+    auto                  request = co_await http.read_request();
     if (request.is_err() || request->is_none()) co_return false;
     auto head          = rstd::move(*request).unwrap();
     auto authorization = head.headers.get_unique_text("authorization"_str);

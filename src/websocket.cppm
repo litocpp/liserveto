@@ -1,6 +1,6 @@
 module;
 #ifdef LITO_FEAT_WEBSOCKET
-export module libserveto:websocket;
+export module liserveto:websocket;
 export import :connection;
 export import liwebsocketo;
 using namespace rstd::prelude;
@@ -8,7 +8,7 @@ using namespace liwebsocketo;
 using rstd::async::coro;
 using rstd::bytes::Bytes;
 
-export namespace libserveto
+export namespace liserveto
 {
 class TcpTransport {
     rstd::net::TcpStream                              stream_;
@@ -109,5 +109,5 @@ public:
         co_return Ok(ServerConnection(rstd::move(driver).unwrap()));
     }
 };
-} // namespace libserveto
+} // namespace liserveto
 #endif

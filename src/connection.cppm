@@ -1,8 +1,9 @@
 module;
 #include <rstd/macro.hpp>
-export module libserveto:connection;
+export module liserveto:connection;
 export import lihttpto;
 export import :response_io;
+export import :response;
 
 import rstd;
 using namespace rstd::prelude;
@@ -10,7 +11,7 @@ using namespace rstd::literals;
 using namespace lihttpto;
 using IoError = rstd::io::error::Error;
 
-export namespace libserveto
+export namespace liserveto
 {
 enum class ConnectionErrorKind
 {
@@ -19,13 +20,15 @@ enum class ConnectionErrorKind
     Io,
     Timeout,
     Expectation,
-    Response
+    Response,
+    Body
 };
 struct ConnectionError {
     ConnectionErrorKind   kind;
     Option<DecodeError>   decode;
     Option<ResponseError> response;
     Option<IoError>       cause;
+    Option<BodyError>     body;
 };
 struct ConnectionLimits {
     HeadLimits           head;
@@ -38,10 +41,11 @@ struct ConnectionLimits {
     usize                requests { 100 };
     // When set, each streamed body write has its own budget instead of the response-wide deadline.
     Option<rstd::time::Duration> stream_write_timeout;
+    Option<rstd::time::Duration> stream_idle_timeout;
 };
-} // namespace libserveto
+} // namespace liserveto
 
-namespace libserveto
+namespace liserveto
 {
 auto connection_error(ConnectionErrorKind kind) -> ConnectionError {
     return ConnectionError { kind, None(), None(), None() };
@@ -56,9 +60,22 @@ auto response_error(ResponseWriteError error) -> ConnectionError {
                              Some(error.kind),
                              rstd::move(error.cause) };
 }
-} // namespace libserveto
+struct ResponseTransfer {
+    liserveto::Response& response;
+    rstd::time::Instant  started { rstd::time::Instant::now() };
+    u64                  bytes {};
+    bool                 done {};
+    void                 finish(ResponseOutcome outcome) {
+        if (done) return;
+        done          = true;
+        response.body = Body {};
+        response.finish({ outcome, bytes, started.elapsed() });
+    }
+    ~ResponseTransfer() { finish(ResponseOutcome::Cancelled); }
+};
+} // namespace liserveto
 
-export namespace libserveto
+export namespace liserveto
 {
 template<typename IO>
 class BasicConnection;
@@ -166,6 +183,7 @@ public:
     auto is_closed() const -> bool { return state_ == State::Closed; }
     auto is_upgraded() const -> bool { return state_ == State::Upgraded; }
     auto ready_for_request() const -> bool { return state_ == State::Idle; }
+    auto body_complete() const -> bool { return state_ == State::Ready; }
 
     // Operations are sequential; cancelling an active operation closes this
     // connection.
@@ -207,7 +225,7 @@ public:
                 upgrade_error_ = offer.unwrap_err();
             auto expectation = request_expectation(head);
             if (expectation.is_err()) {
-                Response rejection;
+                lihttpto::Response rejection;
                 rejection.status = u16(417);
                 auto written     = co_await write_response(*stream_,
                                                            rejection,
@@ -320,7 +338,7 @@ public:
         co_return Ok(UpgradedIO<IO> { stream_.take().unwrap(), rstd::move(pending) });
     }
 
-    auto respond(const Response& response, bool close_after = false)
+    auto respond(const lihttpto::Response& response, bool close_after = false)
         -> rstd::async::coro<Result<empty, ConnectionError>> {
         if (state_ != State::Ready && ! (state_ == State::Body && close_after))
             co_return Err(connection_error(ConnectionErrorKind::State));
@@ -340,6 +358,128 @@ public:
         else
             close();
         operation.complete = true;
+        co_return Ok(empty {});
+    }
+
+    auto send(liserveto::Response response) -> rstd::async::coro<Result<empty, ConnectionError>> {
+        ResponseTransfer transfer { response };
+        if ((state_ != State::Ready && state_ != State::Body) || response.body.requires_input()) {
+            close();
+            transfer.finish(ResponseOutcome::SourceError);
+            co_return Err(connection_error(ConnectionErrorKind::State));
+        }
+        bool unread = state_ == State::Body;
+        bool reuse  = keep_alive_ && ! response.close_after && ! unread;
+        auto method = lihttpto::Method::parse(method_.as_str()).unwrap();
+        auto made   = lihttpto::ResponseEncoder::make(response.head,
+                                                      method,
+                                                      version_,
+                                                      response.content_length,
+                                                      reuse,
+                                                      limits_.head.total_bytes);
+        if (made.is_err()) {
+            close();
+            transfer.finish(ResponseOutcome::SourceError);
+            co_return Err(response_error({ made.unwrap_err(), None() }));
+        }
+        auto encoder      = rstd::move(made).unwrap();
+        state_            = State::Writing;
+        continue_pending_ = false;
+        Operation operation { *this };
+        auto      head = encoder.take_head().unwrap();
+        auto      written =
+            co_await write_with_deadline(*stream_, head, transfer.started, limits_.write_timeout);
+        if (written.is_err()) {
+            transfer.finish(written.unwrap_err().kind == ResponseError::Timeout
+                                ? ResponseOutcome::Timeout
+                                : ResponseOutcome::WriteError);
+            co_return Err(response_error(rstd::move(written).unwrap_err()));
+        }
+        unsigned budget = 64;
+        if (encoder.framing().kind != lihttpto::BodyKind::None)
+            for (;;) {
+                if (budget-- == 0) {
+                    budget = 64;
+                    co_await rstd::async::yield_now();
+                }
+                auto next = [&]() -> rstd::async::coro<Result<Option<BodyItem>, ConnectionError>> {
+                    auto idle = limits_.stream_idle_timeout;
+                    if (idle.is_none() && limits_.stream_write_timeout.is_none()) {
+                        auto elapsed = transfer.started.elapsed();
+                        if (elapsed >= limits_.write_timeout)
+                            co_return Err(connection_error(ConnectionErrorKind::Timeout));
+                        idle = Some(limits_.write_timeout - elapsed);
+                    }
+                    if (idle.is_none()) co_return Ok(co_await rstd::stream::next(response.body));
+                    auto waited =
+                        co_await rstd::async::timeout(rstd::stream::next(response.body), *idle);
+                    if (waited.is_err())
+                        co_return Err(connection_error(ConnectionErrorKind::Timeout));
+                    co_return Ok(rstd::move(waited).unwrap());
+                };
+                auto part = co_await next();
+                if (part.is_err()) {
+                    transfer.finish(ResponseOutcome::Timeout);
+                    co_return Err(rstd::move(part).unwrap_err());
+                }
+                auto item = rstd::move(part).unwrap();
+                if (item.is_none()) break;
+                auto frame = item.take().unwrap();
+                if (frame.is_err()) {
+                    auto error = frame.unwrap_err();
+                    transfer.finish(error == BodyError::Timeout ? ResponseOutcome::Timeout
+                                                                : ResponseOutcome::SourceError);
+                    co_return Err(ConnectionError {
+                        ConnectionErrorKind::Body, None(), None(), None(), Some(error) });
+                }
+                u64 payload {};
+                if (frame->is_Data()) payload = u64(frame->as_Data().bytes.len().to_primitive());
+                auto encoded = encoder.encode(rstd::move(frame).unwrap());
+                if (encoded.is_err()) {
+                    transfer.finish(ResponseOutcome::SourceError);
+                    co_return Err(response_error({ encoded.unwrap_err(), None() }));
+                }
+                auto started = limits_.stream_write_timeout.is_some() ? rstd::time::Instant::now()
+                                                                      : transfer.started;
+                auto timeout = limits_.stream_write_timeout.is_some()
+                                   ? *limits_.stream_write_timeout
+                                   : limits_.write_timeout;
+                auto output  = co_await write_with_deadline(*stream_, *encoded, started, timeout);
+                if (output.is_err()) {
+                    transfer.finish(output.unwrap_err().kind == ResponseError::Timeout
+                                        ? ResponseOutcome::Timeout
+                                        : ResponseOutcome::WriteError);
+                    co_return Err(response_error(rstd::move(output).unwrap_err()));
+                }
+                transfer.bytes += payload;
+            }
+        auto tail = encoder.finish();
+        if (tail.is_err()) {
+            transfer.finish(ResponseOutcome::SourceError);
+            co_return Err(response_error({ tail.unwrap_err(), None() }));
+        }
+        if (! tail->is_empty()) {
+            auto started = limits_.stream_write_timeout.is_some() ? rstd::time::Instant::now()
+                                                                  : transfer.started;
+            auto timeout = limits_.stream_write_timeout.is_some() ? *limits_.stream_write_timeout
+                                                                  : limits_.write_timeout;
+            auto output  = co_await write_with_deadline(*stream_, *tail, started, timeout);
+            if (output.is_err()) {
+                transfer.finish(output.unwrap_err().kind == ResponseError::Timeout
+                                    ? ResponseOutcome::Timeout
+                                    : ResponseOutcome::WriteError);
+                co_return Err(response_error(rstd::move(output).unwrap_err()));
+            }
+        }
+        body_ = None();
+        if (encoder.keep_alive())
+            state_ = State::Idle;
+        else if (unread)
+            co_await finish_rejection();
+        else
+            close();
+        operation.complete = true;
+        transfer.finish(ResponseOutcome::Complete);
         co_return Ok(empty {});
     }
 
@@ -399,10 +539,11 @@ public:
         return Ok(empty {});
     }
 
-    auto reject(const Response& response) -> rstd::async::coro<Result<empty, ConnectionError>> {
+    auto reject(const lihttpto::Response& response)
+        -> rstd::async::coro<Result<empty, ConnectionError>> {
         co_return co_await respond(response, true);
     }
 };
 using Connection         = BasicConnection<rstd::net::TcpStream>;
 using UpgradedConnection = UpgradedIO<rstd::net::TcpStream>;
-} // namespace libserveto
+} // namespace liserveto

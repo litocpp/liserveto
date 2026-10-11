@@ -4,15 +4,15 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #endif
-import libserveto;
+import liserveto;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
-using libserveto::ConfinedDir;
+using liserveto::ConfinedDir;
 
 #if RSTD_OS_LINUX
 TEST(ConfinedDir, ReadOnlyPathsLinksAndStableHandles) {
-    auto temporary  = rstd::fs::TempDir::make("libserveto-confined"_str).unwrap();
+    auto temporary  = rstd::fs::TempDir::make("liserveto-confined"_str).unwrap();
     auto base       = rstd::path::PathBuf::from(temporary.path().as_os_str().to_os_string());
     auto root_path  = base.join("root"_str);
     auto child_path = root_path.join("sub"_str);

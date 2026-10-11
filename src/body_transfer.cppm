@@ -1,11 +1,11 @@
-export module libserveto:body_transfer;
+export module liserveto:body_transfer;
 export import lihttpto;
 export import :connection;
 
 using namespace rstd::prelude;
 using namespace lihttpto;
 using Bytes = rstd::bytes::Bytes;
-export namespace libserveto
+export namespace liserveto
 {
 class RequestBodySource {
     Connection& connection_;
@@ -57,4 +57,4 @@ public:
         co_return co_await connection_.write_body(bytes);
     }
 };
-} // namespace libserveto
+} // namespace liserveto

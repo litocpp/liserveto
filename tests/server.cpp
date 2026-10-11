@@ -1,16 +1,77 @@
 #include <rstd/test/gtest.hpp>
-import libserveto;
+import liserveto;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace lihttpto;
-using namespace libserveto;
+using namespace liserveto;
+using lihttpto::Response;
+
+auto endpoint_loopback() -> rstd::async::coro<bool> {
+    auto listener =
+        rstd::net::TcpListener::bind(rstd::net::SocketAddr::ipv4_loopback(u16())).unwrap();
+    auto address  = listener.local_addr().unwrap();
+    auto stop     = liserveto::Shutdown::make().unwrap();
+    int  calls    = 0;
+    auto endpoint = liserveto::Endpoint::make(
+        [&](liserveto::Request request) -> rstd::async::coro<liserveto::ResponseResult> {
+            if (request.peer.is_none())
+                co_return Err(liserveto::Error { liserveto::ErrorKind::Internal });
+            ++calls;
+            if (calls == 1) {
+                if (request.target() != "/one"_str)
+                    co_return Err(liserveto::Error { liserveto::ErrorKind::Internal });
+                co_return Ok(liserveto::Response::stream(liserveto::Body::from_bytes(
+                    rstd::bytes::Bytes::copy_from_slice("ok"_str.as_bytes()))));
+            }
+            if (request.target() != "/two"_str)
+                co_return Err(liserveto::Error { liserveto::ErrorKind::Internal });
+            co_return Ok(liserveto::Response::bytes(
+                rstd::bytes::Bytes::copy_from_slice("next"_str.as_bytes())));
+        });
+    auto server = rstd::async::AbortOnDropHandle(rstd::async::spawn(
+        liserveto::serve(rstd::move(listener),
+                         rstd::sync::Arc<liserveto::Endpoint>::make(rstd::move(endpoint)),
+                         stop.clone())));
+    auto client = (co_await rstd::net::TcpStream::connect(address)).unwrap();
+    auto sent   = co_await rstd::async::io::write_all(
+        client,
+        rstd::bytes::Bytes::copy_from_slice(
+            "GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"_str
+                .as_bytes()));
+    if (sent.is_err()) co_return false;
+    rstd::bytes::BytesMut output;
+    for (;;) {
+        rstd::bytes::BytesMut chunk;
+        auto                  read = co_await rstd::async::io::read(client, chunk);
+        if (read.is_err()) co_return false;
+        if (*read == usize()) break;
+        output.put_slice(chunk.as_slice());
+        if (output.len() > usize(4096)) co_return false;
+    }
+    (void)stop.request_stop();
+    auto report = co_await rstd::move(server);
+    if (report.is_err() || report->is_err() || (**report).accepted != usize(1) ||
+        (**report).failed != usize() || calls != 2)
+        co_return false;
+    auto text = rstd::str_::from_utf8(output.as_slice()).unwrap();
+    co_return text.contains(
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n2\r\nok\r\n0\r\n\r\nHTTP/1.1 200"_str) &&
+        text.ends_with("Connection: close\r\n\r\nnext"_str);
+}
+TEST(EndpointServer, LoopbackReusesConnectionAndPassesPeerThroughServe) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto result  = runtime.block_on(rstd::async::timeout(
+        rstd::async::into_future(endpoint_loopback()), rstd::time::Duration::from_secs(u64(2))));
+    ASSERT_TRUE(result.is_ok());
+    EXPECT_TRUE(*result);
+}
 
 namespace
 {
 struct Echo {
     auto operator()(Connection& connection, const RequestHead&, const Shutdown&) const
         -> rstd::async::coro<Result<empty, ConnectionError>> {
-        Response response;
+        lihttpto::Response response;
         response.body = rstd::bytes::Bytes::copy_from_slice("ok"_str.as_bytes());
         co_return co_await connection.respond(response, true);
     }
@@ -80,7 +141,7 @@ struct Gated {
         if (ready.is_err())
             co_return Err(ConnectionError {
                 ConnectionErrorKind::Io, None(), None(), Some(rstd::move(ready).unwrap_err()) });
-        Response response;
+        lihttpto::Response response;
         response.body = rstd::bytes::Bytes::copy_from_slice("ok"_str.as_bytes());
         co_return co_await connection.respond(response, true);
     }

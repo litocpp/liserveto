@@ -1,10 +1,11 @@
 #include <rstd/test/gtest.hpp>
-import libserveto;
+import liserveto;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace lihttpto;
-using namespace libserveto;
+using namespace liserveto;
+using lihttpto::Response;
 
 namespace
 {
@@ -29,7 +30,7 @@ auto pipeline(rstd::net::TcpStream server, rstd::net::TcpStream& client)
     auto first = co_await connection.read_request();
     if (first.is_err() || first->is_none() || first->unwrap().line.target.as_str() != "/one"_str)
         co_return false;
-    Response response;
+    lihttpto::Response response;
     if ((co_await connection.respond(response)).is_ok()) co_return false;
     if ((co_await connection.read_request()).is_ok()) co_return false;
     Vec<u8> content;
@@ -49,7 +50,7 @@ auto pipeline(rstd::net::TcpStream server, rstd::net::TcpStream& client)
     auto second = co_await connection.read_request();
     if (second.is_err() || second->is_none() || second->unwrap().line.target.as_str() != "/two"_str)
         co_return false;
-    Response empty_response;
+    lihttpto::Response empty_response;
     if ((co_await connection.respond(empty_response)).is_err()) co_return false;
     if (! (co_await receive(client,
                             "HTTP/1.1 200 \r\nContent-Length: 0\r\nConnection: close\r\n\r\n"_str)))
@@ -79,8 +80,8 @@ auto expectation(rstd::net::TcpStream server, rstd::net::TcpStream& client)
     }
     auto trailers = connection.take_trailers();
     if (trailers.is_none() || trailers->len() != usize(1) || total != usize(1)) co_return false;
-    Response response;
-    auto     sent = co_await connection.respond(response, true);
+    lihttpto::Response response;
+    auto               sent = co_await connection.respond(response, true);
     co_return sent.is_ok() && connection.is_closed() &&
         (co_await receive(client,
                           "HTTP/1.1 200 \r\nContent-Length: 0\r\nConnection: close\r\n\r\n"_str));
@@ -140,8 +141,8 @@ auto write_timeout(rstd::net::TcpStream server, rstd::net::TcpStream& client)
     if (! (co_await send(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"_str))) co_return false;
     auto head = co_await connection.read_request();
     if (head.is_err() || head->is_none()) co_return false;
-    Response response;
-    auto     written = co_await connection.respond(response);
+    lihttpto::Response response;
+    auto               written = co_await connection.respond(response);
     co_return written.is_err() &&
         written.unwrap_err().kind == ConnectionErrorKind::Timeout&& connection.is_closed();
 }
@@ -170,7 +171,7 @@ auto reject_request(rstd::net::TcpStream server, rstd::net::TcpStream& client, r
     if (! (co_await send(client, wire))) co_return false;
     auto head = co_await connection.read_request();
     if (head.is_err() || head->is_none()) co_return false;
-    Response response;
+    lihttpto::Response response;
     response.status = u16(403);
     auto rejected   = co_await connection.reject(response);
     if (rejected.is_err() || ! connection.is_closed()) co_return false;
@@ -209,7 +210,7 @@ auto cancel_rejection(rstd::net::TcpStream server, rstd::net::TcpStream& client)
         co_return false;
     auto head = co_await connection.read_request();
     if (head.is_err() || head->is_none()) co_return false;
-    Response response;
+    lihttpto::Response response;
     response.status = u16(403);
     auto rejected   = rstd::async::spawn(connection.reject(response));
     if (! (co_await receive(
@@ -234,7 +235,7 @@ auto empty_expect(rstd::net::TcpStream server, rstd::net::TcpStream& client)
     if ((co_await connection.accept_body()).is_err()) co_return false;
     auto body = co_await connection.read_body();
     if (body.is_err() || body->is_some()) co_return false;
-    Response response;
+    lihttpto::Response response;
     if ((co_await connection.respond(response, true)).is_err()) co_return false;
     co_return co_await receive(
         client, "HTTP/1.1 200 \r\nContent-Length: 0\r\nConnection: close\r\n\r\n"_str);
@@ -254,7 +255,7 @@ auto implicit_continue(rstd::net::TcpStream server, rstd::net::TcpStream& client
     if (part.is_err() || part->is_none() || sent.is_err() || ! *sent) co_return false;
     auto bytes = rstd::move(*part).unwrap();
     if (bytes.len() != usize(1) || bytes[usize()] != u8('x')) co_return false;
-    Response response;
+    lihttpto::Response response;
     if ((co_await connection.respond(response, true)).is_err()) co_return false;
     co_return co_await receive(
         client, "HTTP/1.1 200 \r\nContent-Length: 0\r\nConnection: close\r\n\r\n"_str);
@@ -333,12 +334,12 @@ TEST(ConnectionUpgrade, PreparedResponseCannotCrossRequests) {
             co_return false;
         if ((co_await connection.read_request()).is_err()) co_return false;
         auto prepared = connection.prepare_upgrade(UpgradeProtocol::make("websocket"_str).unwrap());
-        if (prepared.is_err() || (co_await connection.respond(Response {})).is_err())
+        if (prepared.is_err() || (co_await connection.respond(lihttpto::Response {})).is_err())
             co_return false;
         if ((co_await connection.read_request()).is_err()) co_return false;
         auto stale = co_await connection.upgrade(rstd::move(prepared).unwrap());
         if (stale.is_ok() || stale.unwrap_err().kind != ConnectionErrorKind::State) co_return false;
-        co_return (co_await connection.respond(Response {}, true)).is_ok();
+        co_return (co_await connection.respond(lihttpto::Response {}, true)).is_ok();
     });
 }
 
@@ -414,7 +415,7 @@ auto typed_target(rstd::net::TcpStream server, rstd::net::TcpStream& client)
     if (head.authority.is_none() || head.authority->name.as_str() != "notebook.test"_str ||
         head.line.resource.segments.len() != usize(1))
         co_return false;
-    Response response;
+    lihttpto::Response response;
     response.body =
         rstd::bytes::Bytes::copy_from_slice(head.line.resource.segments[usize()].as_slice());
     if ((co_await connection.respond(response)).is_err()) co_return false;
@@ -450,7 +451,7 @@ auto streaming(rstd::net::TcpStream server, rstd::net::TcpStream& client)
     if ((co_await connection.begin_response(response)).is_err()) co_return false;
     if (! (co_await receive(client, "HTTP/1.1 200 \r\nConnection: close\r\n\r\n"_str)))
         co_return false;
-    Response complete;
+    lihttpto::Response complete;
     if (connection.ready_for_request() || (co_await connection.read_request()).is_ok() ||
         (co_await connection.respond(complete)).is_ok() ||
         (co_await connection.begin_response(response)).is_ok())

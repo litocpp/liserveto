@@ -1,18 +1,19 @@
 #include <rstd/test/gtest.hpp>
-import libserveto;
+import liserveto;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace lihttpto;
-using namespace libserveto;
+using namespace liserveto;
+using lihttpto::Response;
 
 namespace
 {
 auto header(ref<str> name, ref<str> value) -> Header {
     return Header::make(name, value.as_bytes()).unwrap();
 }
-auto make_response() -> Response {
-    Response response;
+auto make_response() -> lihttpto::Response {
+    lihttpto::Response response;
     response.body = rstd::bytes::Bytes::copy_from_slice("hello"_str.as_bytes());
     response.headers.push(header("Content-Type"_str, "text/plain"_str));
     return response;
@@ -109,14 +110,14 @@ TEST(Response, SpecialStatusBodyRules) {
         invalid.status = status;
         EXPECT_EQ(encode_response_head(invalid, "GET"_str, Version::Http11).unwrap_err(),
                   ResponseError::InvalidBody);
-        Response empty_response;
+        lihttpto::Response empty_response;
         empty_response.status = status;
         auto encoded          = encode_response_head(empty_response, "GET"_str, Version::Http11);
         ASSERT_TRUE(encoded.is_ok());
         auto text = rstd::str_::from_utf8(encoded->as_slice()).unwrap();
         EXPECT_EQ(text.contains("Content-Length:"_str), status == u16(205));
     }
-    Response response;
+    lihttpto::Response response;
     response.status = u16(101);
     EXPECT_EQ(encode_response_head(response, "GET"_str, Version::Http11).unwrap_err(),
               ResponseError::InvalidStatus);
