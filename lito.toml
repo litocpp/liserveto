@@ -1,0 +1,31 @@
+[package]
+name = "libserveto"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["hypengw <hypengwip@gmail.com>"]
+
+[lib]
+name = "libserveto"
+module = "libserveto"
+archive = "libserveto"
+
+[features.websocket]
+default = false
+
+[dependencies]
+lihttpto = { path = "../lihttpto", pub = true }
+rstd-std = { version = "0.1.7", pub = true }
+liwebsocketo = { path = "../liwebsocketo", pub = true, condition = "feature.websocket" }
+
+[dev-dependencies]
+rstd-test = { version = "0.1.7" }
+rstd-nostd = { version = "0.1.7", usage = "link" }
+
+[[test]]
+name = "libserveto-tests"
+sources = ["tests/main.cpp", "tests/body.cpp", "tests/connection.cpp", "tests/server.cpp", "tests/response.cpp", "tests/websocket.cpp", "tests/transport.cpp", "tests/confined_dir.cpp"]
+link-stdlib = false
+
+[profile.base]
+exceptions = false
+rtti = false
