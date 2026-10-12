@@ -74,14 +74,16 @@ auto dispatch_connection(IO                            stream,
         auto head = rstd::move(*request).unwrap();
         if constexpr (requires { handler->call(rstd::declval<Request>()); }) {
             RequestCompletion completion(cleanup.clone());
-            auto              incoming = IncomingBody::from_connection(connection.clone());
-            auto              scope    = incoming.scope();
-            auto response = co_await handler->call(Request(rstd::move(head),
-                                                           rstd::move(incoming),
-                                                           shutdown.clone(),
-                                                           peer,
-                                                           completion.lifetime.clone(),
-                                                           connection->upgrade_permit()));
+            auto              incoming         = IncomingBody::from_connection(connection.clone());
+            auto              scope            = incoming.scope();
+            auto              incoming_request = Request(rstd::move(head),
+                                                         rstd::move(incoming),
+                                                         shutdown.clone(),
+                                                         peer,
+                                                         completion.lifetime.clone(),
+                                                         connection->upgrade_permit());
+            completion.attach(incoming_request);
+            auto response = co_await handler->call(rstd::move(incoming_request));
             scope.expire();
             if (response.is_err()) {
                 liserveto::Response rejection;

@@ -62,12 +62,22 @@ auto ConfinedDir::open(ref<Path> path) -> rstd::io::Result<ConfinedDir> {
     return Err(IoError::from_kind(IoErrorKind { IoErrorKind::Unsupported }));
 #endif
 }
-auto ConfinedDir::open_file(ref<Path> path) const -> rstd::io::Result<rstd::fs::File> {
+auto ConfinedDir::open_entry(ref<Path> path) const -> rstd::io::Result<ConfinedEntry> {
     auto fd   = rstd_try(open_confined_at(directory_, path, false));
     auto file = rstd::fs::File(rstd::move(fd));
     auto info = rstd_try(file.metadata());
-    if (! info.is_file()) return Err(IoError::from_kind(IoErrorKind { IoErrorKind::InvalidInput }));
-    return Ok(rstd::move(file));
+    return Ok(ConfinedEntry(rstd::move(file), rstd::move(info)));
+}
+auto ConfinedDir::open_file(ref<Path> path) const -> rstd::io::Result<rstd::fs::File> {
+    auto entry = rstd_try(open_entry(path));
+    if (! entry.metadata().is_file())
+        return Err(IoError::from_kind(IoErrorKind { IoErrorKind::InvalidInput }));
+    return Ok(rstd::move(entry).into_file());
+}
+auto ConfinedEntry::into_directory() && -> rstd::io::Result<ConfinedDir> {
+    if (! metadata_.is_dir())
+        return Err(IoError::from_kind(IoErrorKind { IoErrorKind::NotADirectory }));
+    return Ok(ConfinedDir(rstd::fs::Dir::from_raw_fd(rstd::move(file_).into_raw_fd())));
 }
 auto ConfinedDir::open_dir(ref<Path> path) const -> rstd::io::Result<ConfinedDir> {
     auto fd = rstd_try(open_confined_at(directory_, path, true));

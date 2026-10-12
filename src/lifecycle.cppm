@@ -78,6 +78,7 @@ struct RequestCompletion;
 export namespace liserveto
 {
 class Response;
+class Request;
 enum class ResponseOutcome
 {
     Complete,
@@ -110,6 +111,7 @@ struct RequestCompletion {
     rstd::time::Instant        started { rstd::time::Instant::now() };
     Arc<ConnectionCleanup>     cleanup;
     explicit RequestCompletion(Arc<ConnectionCleanup> owner): cleanup(rstd::move(owner)) {}
+    void attach(liserveto::Request& request);
     void attach(liserveto::Response& response);
     ~RequestCompletion() {
         cleanup->complete([lifetime = lifetime.clone(), elapsed = started.elapsed()] {

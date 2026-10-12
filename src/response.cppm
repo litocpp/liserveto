@@ -21,6 +21,18 @@ struct StoredResponseObserver {
     void finish(const liserveto::ResponseReport& report) { function(report); }
 };
 
+struct ResponseBodyClose {
+    using Output = empty;
+    liserveto::BodyClose                              closing;
+    rstd::sync::Arc<rstd::sync::atomic::Atomic<bool>> failed;
+    auto poll(mut_ref<ResponseBodyClose> self, rstd::task::Context& cx) -> rstd::task::Poll<empty> {
+        auto result = rstd::future::poll(self->closing, cx);
+        if (result.is_pending()) return rstd::task::Poll<empty>::Pending();
+        self->failed->store(rstd::move(result).take().is_err());
+        return rstd::task::Poll<empty>::Ready(empty {});
+    }
+};
+
 export namespace liserveto
 {
 class Response {
@@ -31,6 +43,7 @@ class Response {
     Option<RequestLifetime>                    lifetime_;
     Option<UpgradePlan>                        upgrade_;
     Option<rstd::sync::Arc<ConnectionCleanup>> cleanup_;
+    Option<BodyClose>                          closing_;
 
 public:
     lihttpto::ResponseHead       head { lihttpto::StatusCode::make(u16(200)).unwrap(), {}, {}, {} };
@@ -48,6 +61,7 @@ public:
           lifetime_(other.lifetime_.take()),
           upgrade_(other.upgrade_.take()),
           cleanup_(other.cleanup_.take()),
+          closing_(other.closing_.take()),
           head(rstd::move(other.head)),
           body(rstd::move(other.body)),
           content_length(other.content_length),
@@ -62,6 +76,7 @@ public:
         lifetime_      = other.lifetime_.take();
         upgrade_       = other.upgrade_.take();
         cleanup_       = other.cleanup_.take();
+        closing_       = other.closing_.take();
         head           = rstd::move(other.head);
         body           = rstd::move(other.body);
         content_length = other.content_length;
@@ -110,18 +125,46 @@ public:
             Box<dyn<UpgradeAction>>::make(StoredUpgradeAction<H> { rstd::move(handler) }) });
         return Ok(rstd::move(result));
     }
+    auto close(ResponseReport report = { ResponseOutcome::Cancelled })
+        -> rstd::async::coro<Result<empty, BodyError>> {
+        if (closing_.is_none()) closing_.insert(body.close());
+        auto result = co_await rstd::future::by_ref(*closing_);
+        closing_    = None();
+        if (result.is_err() && report.outcome == ResponseOutcome::Complete)
+            report.outcome = ResponseOutcome::SourceError;
+        finish(report);
+        co_return rstd::move(result);
+    }
+    // Without a connection owner this only discards; close() provides the explicit barrier.
     void finish(ResponseReport report) {
-        body     = Body {};
+        if (body.is_empty() && closing_.is_none() && lifetime_.is_none() && observer_.is_none() &&
+            upgrade_.is_none()) {
+            cleanup_ = None();
+            return;
+        }
+        auto failed = rstd::sync::Arc<rstd::sync::atomic::Atomic<bool>>::make(false);
+        {
+            auto closing = closing_.is_some() ? closing_.take().unwrap() : body.close();
+            if (closing.is_immediate()) {
+                auto cx = rstd::task::Context(rstd::task::Waker::noop());
+                failed->store(rstd::move(rstd::future::poll(closing, cx)).take().is_err());
+            } else if (cleanup_.is_some())
+                (*cleanup_)->defer(ResponseBodyClose { rstd::move(closing), failed.clone() });
+        }
         upgrade_ = None();
         if (lifetime_.is_none() && observer_.is_none()) {
             cleanup_ = None();
             return;
         }
-        auto complete =
-            [lifetime = lifetime_.take(), observer = observer_.take(), report]() mutable {
-                if (lifetime.is_some()) lifetime->event_.finish(report);
-                if (observer.is_some()) (*observer)->finish(report);
-            };
+        auto complete = [lifetime = lifetime_.take(),
+                         observer = observer_.take(),
+                         report,
+                         failed = rstd::move(failed)]() mutable {
+            if (failed->load() && report.outcome == ResponseOutcome::Complete)
+                report.outcome = ResponseOutcome::SourceError;
+            if (lifetime.is_some()) lifetime->event_.finish(report);
+            if (observer.is_some()) (*observer)->finish(report);
+        };
         if (cleanup_.is_some())
             cleanup_.take().unwrap()->complete(rstd::move(complete));
         else

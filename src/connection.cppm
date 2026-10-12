@@ -67,8 +67,7 @@ struct ResponseTransfer {
     bool                 done {};
     void                 finish(ResponseOutcome outcome) {
         if (done) return;
-        done          = true;
-        response.body = Body {};
+        done = true;
         response.finish({ outcome, bytes, started.elapsed() });
     }
     ~ResponseTransfer() { finish(ResponseOutcome::Cancelled); }
@@ -361,9 +360,8 @@ public:
         co_return Ok(empty {});
     }
 
-    auto
-    send(liserveto::Response                response,
-         rstd::sync::Arc<ConnectionCleanup> cleanup = rstd::sync::Arc<ConnectionCleanup>::make())
+private:
+    auto send_response(liserveto::Response response, rstd::sync::Arc<ConnectionCleanup> cleanup)
         -> rstd::async::coro<Result<empty, ConnectionError>> {
         ResponseTransfer transfer { response };
         if (response.upgrade_.is_some()) {
@@ -553,6 +551,20 @@ public:
         operation.complete = true;
         transfer.finish(ResponseOutcome::Complete);
         co_return Ok(empty {});
+    }
+
+public:
+    auto
+    send(liserveto::Response                response,
+         rstd::sync::Arc<ConnectionCleanup> cleanup = rstd::sync::Arc<ConnectionCleanup>::make())
+        -> rstd::async::coro<Result<empty, ConnectionError>> {
+        if (response.cleanup_.is_some())
+            cleanup = (*response.cleanup_).clone();
+        else
+            response.cleanup_ = Some(cleanup.clone());
+        auto result = co_await send_response(rstd::move(response), cleanup.clone());
+        co_await ConnectionCleanupWait { rstd::move(cleanup) };
+        co_return rstd::move(result);
     }
 
     // Streamed responses may declare a length and always close the connection.

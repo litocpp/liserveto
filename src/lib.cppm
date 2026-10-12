@@ -10,6 +10,8 @@ export import :sse;
 export import :body_transfer;
 export import :static_files.confined_dir;
 export import :static_files.representation;
+export import :static_files.file;
+export import :static_files;
 #ifdef LITO_FEAT_JSON
 export import :json;
 #endif

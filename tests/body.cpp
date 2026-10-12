@@ -62,3 +62,65 @@ TEST(Body, BoxedSourceKeepsPendingStateAcrossWaitCancellationAndBodyMove) {
     EXPECT_EQ(next->unwrap().as_Data().bytes.as_slice(), "x"_str.as_bytes());
     EXPECT_EQ(polls, 2);
 }
+
+struct ClosingState {
+    int  polls {}, releases {};
+    bool ready {}, failed {};
+};
+struct ClosingBody {
+    using Item = BodyItem;
+    rstd::sync::Arc<ClosingState> state;
+    ClosingBody(rstd::sync::Arc<ClosingState> value): state(rstd::move(value)) {}
+    ClosingBody(ClosingBody&&) noexcept = default;
+    ~ClosingBody() {
+        if (state) ++state->releases;
+    }
+    auto poll_next(mut_ref<ClosingBody>, rstd::task::Context&) -> rstd::task::Poll<Option<Item>> {
+        return rstd::task::Poll<Option<Item>>::Ready(None());
+    }
+    auto poll_close(mut_ref<ClosingBody> self, rstd::task::Context&)
+        -> rstd::task::Poll<Result<empty, BodyError>> {
+        ++self->state->polls;
+        if (! self->state->ready) return rstd::task::Poll<Result<empty, BodyError>>::Pending();
+        return rstd::task::Poll<Result<empty, BodyError>>::Ready(
+            self->state->failed ? Result<empty, BodyError>(Err(BodyError::Io))
+                                : Result<empty, BodyError>(Ok(empty {})));
+    }
+};
+TEST(Body, EofWaitsForCloseAndCloseFailureIsReportedOnce) {
+    auto state = rstd::sync::Arc<ClosingState>::make();
+    auto body  = Body::from_stream(ClosingBody(state.clone()));
+    auto cx    = rstd::task::Context(rstd::task::Waker::noop());
+    EXPECT_TRUE(rstd::future::poll_next(body, cx).is_pending());
+    EXPECT_EQ(state->releases, 0);
+    state->ready  = true;
+    state->failed = true;
+    auto last     = rstd::move(rstd::future::poll_next(body, cx)).take();
+    EXPECT_TRUE(last.is_some());
+    if (last.is_some()) EXPECT_EQ(last->unwrap_err(), BodyError::Io);
+    EXPECT_EQ(state->releases, 1);
+    EXPECT_TRUE(rstd::move(rstd::future::poll_next(body, cx)).take().is_none());
+}
+TEST(Body, ResponseCloseRetainsWaitAcrossCancellationAndMove) {
+    auto state    = rstd::sync::Arc<ClosingState>::make();
+    auto response = Response::stream(Body::from_stream(ClosingBody(state.clone())));
+    int  notified {};
+    response.on_finish([&](const ResponseReport& report) {
+        EXPECT_EQ(report.outcome, ResponseOutcome::SourceError);
+        EXPECT_EQ(state->releases, 1);
+        ++notified;
+    });
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto waiting = rstd::async::into_future(response.close({ ResponseOutcome::Complete }));
+    EXPECT_TRUE(runtime.block_on(rstd::async::timeout(rstd::move(waiting), rstd::time::Duration {}))
+                    .is_err());
+    EXPECT_EQ(notified, 0);
+    auto moved    = rstd::move(response);
+    state->ready  = true;
+    state->failed = true;
+    auto result   = runtime.block_on(moved.close({ ResponseOutcome::Complete }));
+    EXPECT_TRUE(result.is_err());
+    EXPECT_EQ(notified, 1);
+    EXPECT_TRUE(runtime.block_on(moved.close()).is_ok());
+    EXPECT_EQ(notified, 1);
+}
