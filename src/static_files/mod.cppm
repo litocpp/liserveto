@@ -31,5 +31,7 @@ public:
     static auto make(ConfinedDir root, StaticFilesOptions options = {})
         -> rstd::io::Result<StaticFiles>;
     auto endpoint() const -> Endpoint;
+    // Requires SPA options; register only explicit navigation routes on a Router.
+    auto navigation_endpoint() const -> rstd::io::Result<Endpoint>;
 };
 } // namespace liserveto

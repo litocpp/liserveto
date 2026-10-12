@@ -52,6 +52,49 @@ void record_completion(ServerReport& report, ConnectionCompletion result) {
         ++report.failed;
 }
 template<typename IO, typename Handler>
+auto dispatch_endpoint(Arc<BasicConnection<IO>>      connection,
+                       Handler&                      handler,
+                       RequestHead                   head,
+                       const Shutdown&               shutdown,
+                       Option<rstd::net::SocketAddr> peer,
+                       Arc<ConnectionCleanup>        cleanup) -> rstd::async::coro<bool> {
+    RequestCompletion completion(cleanup.clone());
+    auto              incoming = IncomingBody::from_connection(connection.clone());
+    auto              scope    = incoming.scope();
+    auto              request  = Request(rstd::move(head),
+                                         rstd::move(incoming),
+                                         shutdown.clone(),
+                                         peer,
+                                         completion.lifetime.clone(),
+                                         connection->upgrade_permit());
+    completion.attach(request);
+    auto response = co_await handler.call(rstd::move(request));
+    scope.expire();
+    if (response.is_err()) {
+        liserveto::Response rejection;
+        const auto&         error = response.unwrap_err();
+        if (error.kind == ErrorKind::Connection) {
+            connection->close();
+            completion.finish(error.body == Some(BodyError::Timeout) ? ResponseOutcome::Timeout
+                              : error.body == Some(BodyError::Cancelled)
+                                  ? ResponseOutcome::Cancelled
+                                  : ResponseOutcome::SourceError);
+            co_return false;
+        }
+        auto status =
+            error.kind == ErrorKind::InvalidRequest ? u16(400)
+            : error.kind == ErrorKind::Body && error.body == Some(BodyError::LimitExceeded)
+                ? u16(413)
+                : u16(500);
+        rejection.head.status = lihttpto::StatusCode::make(status).unwrap();
+        rejection.close_after = true;
+        completion.attach(rejection);
+        co_return (co_await connection->send(rstd::move(rejection), cleanup.clone())).is_ok();
+    }
+    completion.attach(*response);
+    co_return (co_await connection->send(rstd::move(response).unwrap(), cleanup.clone())).is_ok();
+}
+template<typename IO, typename Handler>
 auto dispatch_connection(IO                            stream,
                          Arc<Handler>                  handler,
                          Shutdown                      shutdown,
@@ -73,40 +116,30 @@ auto dispatch_connection(IO                            stream,
         if (shutdown.requested()) co_return true;
         auto head = rstd::move(*request).unwrap();
         if constexpr (requires { handler->call(rstd::declval<Request>()); }) {
-            RequestCompletion completion(cleanup.clone());
-            auto              incoming         = IncomingBody::from_connection(connection.clone());
-            auto              scope            = incoming.scope();
-            auto              incoming_request = Request(rstd::move(head),
-                                                         rstd::move(incoming),
-                                                         shutdown.clone(),
-                                                         peer,
-                                                         completion.lifetime.clone(),
-                                                         connection->upgrade_permit());
-            completion.attach(incoming_request);
-            auto response = co_await handler->call(rstd::move(incoming_request));
-            scope.expire();
-            if (response.is_err()) {
-                liserveto::Response rejection;
-                const auto&         error = response.unwrap_err();
-                auto                status =
-                    error.kind == ErrorKind::InvalidRequest ? u16(400)
-                    : error.kind == ErrorKind::Body && error.body == Some(BodyError::LimitExceeded)
-                        ? u16(413)
-                        : u16(500);
-                rejection.head.status = lihttpto::StatusCode::make(status).unwrap();
-                rejection.close_after = true;
-                completion.attach(rejection);
-                if ((co_await connection->send(rstd::move(rejection), cleanup.clone())).is_err())
+            if (! (co_await dispatch_endpoint(connection.clone(),
+                                              *handler,
+                                              rstd::move(head),
+                                              shutdown,
+                                              peer,
+                                              cleanup.clone())))
+                co_return false;
+        } else {
+            Option<Endpoint> selected;
+            if constexpr (requires { handler->select_endpoint(head); }) {
+                selected = handler->select_endpoint(head);
+            }
+            if (selected.is_some()) {
+                if (! (co_await dispatch_endpoint(connection.clone(),
+                                                  *selected,
+                                                  rstd::move(head),
+                                                  shutdown,
+                                                  peer,
+                                                  cleanup.clone())))
                     co_return false;
             } else {
-                completion.attach(*response);
-                if ((co_await connection->send(rstd::move(response).unwrap(), cleanup.clone()))
-                        .is_err())
-                    co_return false;
+                auto handled = co_await (*handler)(*connection, head, shutdown);
+                if (handled.is_err()) co_return false;
             }
-        } else {
-            auto handled = co_await (*handler)(*connection, head, shutdown);
-            if (handled.is_err()) co_return false;
         }
         if (connection->is_closed() || connection->is_upgraded()) co_return true;
         if (! connection->ready_for_request()) co_return false;
@@ -131,6 +164,7 @@ auto run_connection(IO                            stream,
 }
 
 // Forced cancellation needs an external ConnectionTask owner to await cleanup.
+// Legacy handlers may select_endpoint(head) -> Option<Endpoint> while migrating individual routes.
 export template<typename IO, typename Handler>
 auto serve_connection(IO                            stream,
                       Arc<Handler>                  handler,

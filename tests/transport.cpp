@@ -91,6 +91,305 @@ TEST(Transport, WriteFailurePreservesCauseAndClosesConnection) {
     EXPECT_TRUE(runtime.block_on(failed_write(wire.clone())));
 }
 
+struct MigratingMemoryHandler {
+    liserveto::Endpoint endpoint;
+    int*                selections;
+    int*                legacy_calls;
+    const void**        selected_path;
+    auto select_endpoint(const lihttpto::RequestHead& head) const -> Option<liserveto::Endpoint> {
+        ++*selections;
+        if (head.line.resource.escaped_path.as_str() != "/new"_str) return None();
+        *selected_path = head.line.resource.escaped_path.as_str().as_bytes().as_raw_ptr();
+        return Some(endpoint.clone());
+    }
+    auto operator()(liserveto::BasicConnection<MemoryIO>& connection,
+                    const lihttpto::RequestHead&          head,
+                    const liserveto::Shutdown&) const
+        -> rstd::async::coro<Result<empty, liserveto::ConnectionError>> {
+        ++*legacy_calls;
+        EXPECT_EQ(head.line.target.as_str(), "/old"_str);
+        lihttpto::Response response;
+        response.body = Bytes::copy_from_slice("old"_bytes);
+        co_return co_await connection.respond(response);
+    }
+};
+TEST(EndpointTransport, SelectedEndpointAndLegacyHandlerShareParsedPipeline) {
+    using namespace liserveto;
+    auto wire = rstd::sync::Arc<MemoryWire>::make();
+    wire->input =
+        Bytes::copy_from_slice("POST /new HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc"
+                               "GET /old HTTP/1.1\r\nHost: x\r\n\r\n"
+                               "GET /new HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"_bytes);
+    int         selections {}, legacy_calls {}, calls {}, completed {};
+    const void* selected_path {};
+    auto        peer = rstd::net::SocketAddr::ipv4_loopback(u16(4321));
+    auto endpoint    = Endpoint::make([&](Request request) -> rstd::async::coro<ResponseResult> {
+        ++calls;
+        EXPECT_TRUE(request.head().line.resource.escaped_path.as_str().as_bytes().as_raw_ptr() ==
+                    selected_path);
+        EXPECT_TRUE(request.peer == Some(peer));
+        EXPECT_FALSE(request.shutdown.requested());
+        auto collected = co_await request.collect(u64(3));
+        EXPECT_TRUE(collected.is_ok());
+        if (collected.is_err()) co_return Err(Error { ErrorKind::Body });
+        EXPECT_TRUE(collected->data.as_slice() == (calls == 1 ? "abc"_bytes : ""_bytes));
+        auto response = Response::bytes(Bytes::copy_from_slice("new"_bytes));
+        response.on_finish([&](const ResponseReport& report) {
+            EXPECT_EQ(report.outcome, ResponseOutcome::Complete);
+            ++completed;
+        });
+        co_return Ok(rstd::move(response));
+    });
+    auto handler     = rstd::sync::Arc<MigratingMemoryHandler>::make(MigratingMemoryHandler {
+        rstd::move(endpoint), &selections, &legacy_calls, &selected_path });
+    auto runtime     = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    EXPECT_TRUE(runtime.block_on(serve_connection(MemoryIO { wire.clone() },
+                                                  rstd::move(handler),
+                                                  Shutdown::make().unwrap(),
+                                                  {},
+                                                  Some(peer))));
+    EXPECT_EQ(selections, 3);
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(legacy_calls, 1);
+    EXPECT_EQ(completed, 2);
+    auto output = rstd::str_::from_utf8(wire->output.as_slice()).unwrap();
+    EXPECT_TRUE(output.contains("\r\n\r\nnewHTTP/1.1 200 "_str));
+    EXPECT_TRUE(output.contains("\r\n\r\noldHTTP/1.1 200 "_str));
+    EXPECT_TRUE(output.ends_with("\r\n\r\nnew"_str));
+}
+TEST(EndpointTransport, SelectedEndpointErrorUsesStandardRejectionAndCloses) {
+    using namespace liserveto;
+    auto wire   = rstd::sync::Arc<MemoryWire>::make();
+    wire->input = Bytes::copy_from_slice(
+        "GET /new HTTP/1.1\r\nHost: x\r\n\r\nGET /old HTTP/1.1\r\nHost: x\r\n\r\n"_bytes);
+    int         selections {}, legacy_calls {};
+    const void* selected_path {};
+    auto        endpoint = Endpoint::make([](Request) -> rstd::async::coro<ResponseResult> {
+        co_return Err(Error { ErrorKind::InvalidRequest });
+    });
+    auto        handler  = rstd::sync::Arc<MigratingMemoryHandler>::make(MigratingMemoryHandler {
+        rstd::move(endpoint), &selections, &legacy_calls, &selected_path });
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    EXPECT_TRUE(runtime.block_on(serve_connection(
+        MemoryIO { wire.clone() }, rstd::move(handler), Shutdown::make().unwrap(), {})));
+    EXPECT_EQ(selections, 1);
+    EXPECT_EQ(legacy_calls, 0);
+    auto output = rstd::str_::from_utf8(wire->output.as_slice()).unwrap();
+    EXPECT_TRUE(output.starts_with("HTTP/1.1 400 "_str));
+    EXPECT_TRUE(output.contains("Connection: close\r\n"_str));
+}
+struct DirectMemoryHandler {
+    liserveto::Endpoint endpoint;
+    int*                selections;
+    auto call(liserveto::Request request) -> rstd::async::coro<liserveto::ResponseResult> {
+        co_return co_await endpoint.call(rstd::move(request));
+    }
+    auto select_endpoint(const lihttpto::RequestHead&) const -> Option<liserveto::Endpoint> {
+        ++*selections;
+        return None();
+    }
+};
+TEST(EndpointTransport, ConnectionFailureDoesNotStartResponseOrReuseInput) {
+    using namespace liserveto;
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto errors  = array<Option<BodyError>, 4> {
+        Some(BodyError::Protocol), Some(BodyError::Timeout), Some(BodyError::Cancelled), None()
+    };
+    auto outcomes = array<ResponseOutcome, 4> { ResponseOutcome::SourceError,
+                                                ResponseOutcome::Timeout,
+                                                ResponseOutcome::Cancelled,
+                                                ResponseOutcome::SourceError };
+    for (usize index {}; index < errors.len(); ++index) {
+        auto wire   = rstd::sync::Arc<MemoryWire>::make();
+        wire->input = Bytes::copy_from_slice(
+            "GET /new HTTP/1.1\r\nHost: x\r\n\r\nGET /old HTTP/1.1\r\nHost: x\r\n\r\n"_bytes);
+        int                     selections {}, legacy_calls {};
+        const void*             selected_path {};
+        Option<RequestLifetime> lifetime;
+        auto endpoint = Endpoint::make([&](Request request) -> rstd::async::coro<ResponseResult> {
+            lifetime.insert(request.lifetime.clone());
+            co_return Err(Error { ErrorKind::Connection, errors[index] });
+        });
+        auto handler  = rstd::sync::Arc<MigratingMemoryHandler>::make(MigratingMemoryHandler {
+            rstd::move(endpoint), &selections, &legacy_calls, &selected_path });
+        EXPECT_FALSE(runtime.block_on(serve_connection(
+            MemoryIO { wire.clone() }, rstd::move(handler), Shutdown::make().unwrap(), {})));
+        EXPECT_EQ(selections, 1);
+        EXPECT_EQ(legacy_calls, 0);
+        EXPECT_TRUE(wire->output.is_empty());
+        ASSERT_TRUE(lifetime.is_some());
+        auto report = lifetime->report();
+        ASSERT_TRUE(report.is_some());
+        EXPECT_EQ(report->outcome, outcomes[index]);
+    }
+}
+TEST(EndpointTransport, DirectEndpointTakesPrecedenceOverSelector) {
+    using namespace liserveto;
+    auto wire = rstd::sync::Arc<MemoryWire>::make();
+    wire->input =
+        Bytes::copy_from_slice("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"_bytes);
+    int  calls {}, selections {};
+    auto endpoint = Endpoint::make([&](Request) -> rstd::async::coro<ResponseResult> {
+        ++calls;
+        co_return Ok(Response {});
+    });
+    auto handler  = rstd::sync::Arc<DirectMemoryHandler>::make(
+        DirectMemoryHandler { rstd::move(endpoint), &selections });
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    EXPECT_TRUE(runtime.block_on(serve_connection(
+        MemoryIO { wire.clone() }, rstd::move(handler), Shutdown::make().unwrap(), {})));
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(selections, 0);
+}
+
+struct DeferredRequestState {
+    bool                               registered {}, released {};
+    int                                retired {}, observed {};
+    Option<liserveto::RequestLifetime> lifetime;
+};
+struct DeferredRequestWork {
+    using Output = empty;
+    rstd::sync::Arc<DeferredRequestState> state;
+    auto poll(mut_ref<DeferredRequestWork> self, Context& cx) -> Poll<empty> {
+        if (! self->state->released) {
+            cx.waker().wake_by_ref();
+            return Poll<empty>::Pending();
+        }
+        ++self->state->retired;
+        return Poll<empty>::Ready(empty {});
+    }
+};
+auto deferred_request_completion(bool cancel) -> rstd::async::coro<bool> {
+    using namespace liserveto;
+    auto state = rstd::sync::Arc<DeferredRequestState>::make();
+    auto wire  = rstd::sync::Arc<MemoryWire>::make();
+    wire->input =
+        Bytes::copy_from_slice("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"_bytes);
+    auto endpoint = Endpoint::make(
+        [state = state.clone(), cancel](Request request) -> rstd::async::coro<ResponseResult> {
+            auto cleanup = request.cleanup().unwrap();
+            cleanup.clone().defer(DeferredRequestWork { state.clone() });
+            state->lifetime.insert(request.lifetime.clone());
+            state->registered = true;
+            if (cancel)
+                for (;;) co_await rstd::async::yield_now();
+            auto response = Response::bytes(Bytes::copy_from_slice("ok"_bytes));
+            response.on_finish([state = state.clone()](const ResponseReport&) {
+                EXPECT_EQ(state->retired, 1);
+                ++state->observed;
+            });
+            co_return Ok(rstd::move(response));
+        });
+    auto task = ConnectionTask::spawn(MemoryIO { wire.clone() },
+                                      rstd::sync::Arc<Endpoint>::make(rstd::move(endpoint)),
+                                      Shutdown::make().unwrap());
+    while (! state->registered) co_await rstd::async::yield_now();
+    if (cancel) task.abort();
+    auto premature = co_await rstd::async::timeout(rstd::future::by_ref(task),
+                                                   rstd::time::Duration::from_millis(u64(1)));
+    EXPECT_TRUE(premature.is_err());
+    EXPECT_TRUE(state->lifetime->report().is_none());
+    EXPECT_EQ(state->retired, 0);
+    EXPECT_EQ(state->observed, 0);
+    state->released = true;
+    if (premature.is_ok()) co_return false;
+    auto result = co_await rstd::future::by_ref(task);
+    auto report = state->lifetime->report();
+    co_return state->retired == 1 && state->observed == (cancel ? 0 : 1) && report.is_some() &&
+        report->outcome == (cancel ? ResponseOutcome::Cancelled : ResponseOutcome::Complete) &&
+        (cancel ? result.is_err() && result.unwrap_err().is_aborted() : result.is_ok() && *result);
+}
+TEST(EndpointTransport, DeferredCleanupDelaysNormalAndCancelledCompletion) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    for (bool cancel : array<bool, 2> { false, true })
+        EXPECT_TRUE(runtime.block_on(deferred_request_completion(cancel)));
+    lihttpto::RequestHeadDecoder decoder;
+    decoder.feed("GET / HTTP/1.1\r\nHost: x\r\n\r\n"_bytes).unwrap();
+    auto request = liserveto::Request(decoder.take().unwrap(),
+                                      liserveto::IncomingBody::from_body(liserveto::Body {}),
+                                      liserveto::Shutdown::make().unwrap());
+    auto bound   = request.cleanup();
+    ASSERT_TRUE(bound.is_err());
+    EXPECT_EQ(bound.unwrap_err().kind().code, rstd::io::error::ErrorKind::NotConnected);
+}
+
+struct SelectedCancellationState {
+    bool started {};
+    int  endpoint_dropped {}, body_dropped {}, completed {};
+};
+struct SelectedEndpointHold {
+    rstd::sync::Arc<SelectedCancellationState> state;
+    explicit SelectedEndpointHold(rstd::sync::Arc<SelectedCancellationState> state)
+        : state(rstd::move(state)) {}
+    ~SelectedEndpointHold() { ++state->endpoint_dropped; }
+};
+struct PendingSelectedBody {
+    using Item = liserveto::BodyItem;
+    rstd::sync::Arc<SelectedCancellationState> state;
+    explicit PendingSelectedBody(rstd::sync::Arc<SelectedCancellationState> state)
+        : state(rstd::move(state)) {}
+    PendingSelectedBody(PendingSelectedBody&&) noexcept = default;
+    ~PendingSelectedBody() {
+        if (state) ++state->body_dropped;
+    }
+    auto poll_next(mut_ref<PendingSelectedBody> self, Context&)
+        -> Poll<Option<liserveto::BodyItem>> {
+        self->state->started = true;
+        return Poll<Option<liserveto::BodyItem>>::Pending();
+    }
+};
+struct CancellingSelectedHandler {
+    rstd::sync::Arc<SelectedCancellationState> state;
+    auto select_endpoint(const lihttpto::RequestHead&) const -> Option<liserveto::Endpoint> {
+        auto endpoint = liserveto::Endpoint::make(
+            [hold = Box<SelectedEndpointHold>::make(state.clone()), state = state.clone()](
+                liserveto::Request) -> rstd::async::coro<liserveto::ResponseResult> {
+                EXPECT_EQ(hold->state->endpoint_dropped, 0);
+                auto response = liserveto::Response::stream(
+                    liserveto::Body::from_stream(PendingSelectedBody(state.clone())));
+                response.on_finish(
+                    [state = state.clone()](const liserveto::ResponseReport& report) {
+                        EXPECT_EQ(report.outcome, liserveto::ResponseOutcome::Cancelled);
+                        EXPECT_EQ(state->body_dropped, 1);
+                        ++state->completed;
+                    });
+                co_return Ok(rstd::move(response));
+            });
+        return Some(rstd::move(endpoint));
+    }
+    auto operator()(liserveto::BasicConnection<MemoryIO>&,
+                    const lihttpto::RequestHead&,
+                    const liserveto::Shutdown&) const
+        -> rstd::async::coro<Result<empty, liserveto::ConnectionError>> {
+        ADD_FAILURE();
+        co_return Ok(empty {});
+    }
+};
+auto cancel_selected_endpoint(rstd::sync::Arc<SelectedCancellationState> state)
+    -> rstd::async::coro<bool> {
+    using namespace liserveto;
+    auto wire    = rstd::sync::Arc<MemoryWire>::make();
+    wire->input  = Bytes::copy_from_slice("GET / HTTP/1.1\r\nHost: x\r\n\r\n"_bytes);
+    auto handler = rstd::sync::Arc<CancellingSelectedHandler>::make(
+        CancellingSelectedHandler { state.clone() });
+    auto task = ConnectionTask::spawn(
+        MemoryIO { wire.clone() }, rstd::move(handler), Shutdown::make().unwrap());
+    for (int index = 0; index < 100 && ! state->started; ++index) co_await rstd::async::yield_now();
+    EXPECT_TRUE(state->started);
+    EXPECT_EQ(state->endpoint_dropped, 0);
+    task.abort();
+    auto result = co_await rstd::future::by_ref(task);
+    co_return result.is_err() && result.unwrap_err().is_aborted();
+}
+TEST(EndpointTransport, SelectedEndpointCancellationWaitsForBodyAndObserver) {
+    auto state   = rstd::sync::Arc<SelectedCancellationState>::make();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    EXPECT_TRUE(runtime.block_on(cancel_selected_endpoint(state.clone())));
+    EXPECT_EQ(state->endpoint_dropped, 1);
+    EXPECT_EQ(state->body_dropped, 1);
+    EXPECT_EQ(state->completed, 1);
+}
+
 TEST(RepresentationResponse, EndpointKeepsPartialHeadAndNotModifiedResponsesDelimited) {
     using namespace liserveto;
     auto wire   = rstd::sync::Arc<MemoryWire>::make();

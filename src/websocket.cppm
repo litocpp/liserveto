@@ -225,11 +225,10 @@ public:
                 else {
                     auto closing = socket.close();
                     auto waited  = co_await rstd::async::timeout(
-                        rstd::async::select(rstd::future::by_ref(closing),
-                                            rstd::future::by_ref(*pending)),
+                        rstd::async::join(rstd::future::by_ref(closing),
+                                          rstd::future::by_ref(*pending)),
                         options.close_timeout);
-                    if (waited.is_ok() && waited->is_right())
-                        result = rstd::move(*waited).unwrap_right();
+                    if (waited.is_ok()) result = rstd::move(*waited).template get<1>();
                 }
                 pending = None();
                 co_await socket.shutdown();

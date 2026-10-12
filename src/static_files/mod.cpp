@@ -137,7 +137,7 @@ auto prepare_static_file(const StaticFilesState& state, StaticPath path, bool fa
     return Ok(PreparedStaticFile { rstd_try(FileResponse::prepare(rstd::move(entry))),
                                    rstd::move(path.relative) });
 }
-auto serve_static_files(Arc<StaticFilesState> state, Request request)
+auto serve_static_files(Arc<StaticFilesState> state, Request request, bool navigation = false)
     -> rstd::async::coro<ResponseResult> {
     auto method = request.head().line.method.as_str();
     if (method != "GET"_str && method != "HEAD"_str) co_return Ok(static_status(u16(405)));
@@ -145,7 +145,7 @@ auto serve_static_files(Arc<StaticFilesState> state, Request request)
     if (path.is_err()) co_return Ok(static_status(path.unwrap_err()));
     auto conditions = lihttpto::RequestConditions::parse(request.head().headers);
     if (conditions.is_err()) co_return Err(Error { ErrorKind::InvalidRequest });
-    bool fallback {};
+    bool fallback = navigation;
     if (state->options.spa.is_some())
         for (const auto& route : state->options.spa->routes)
             fallback = fallback || route == path->relative;
@@ -193,5 +193,12 @@ auto StaticFiles::endpoint() const -> Endpoint {
     return Endpoint::make([state = state_.clone()](Request request) {
         return serve_static_files(state.clone(), rstd::move(request));
     });
+}
+auto StaticFiles::navigation_endpoint() const -> rstd::io::Result<Endpoint> {
+    if (state_->options.spa.is_none())
+        return Err(IoError::from_kind(IoErrorKind { IoErrorKind::InvalidInput }));
+    return Ok(Endpoint::make([state = state_.clone()](Request request) {
+        return serve_static_files(state.clone(), rstd::move(request), true);
+    }));
 }
 } // namespace liserveto

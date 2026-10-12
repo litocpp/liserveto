@@ -113,9 +113,10 @@ struct RequestCompletion {
     explicit RequestCompletion(Arc<ConnectionCleanup> owner): cleanup(rstd::move(owner)) {}
     void attach(liserveto::Request& request);
     void attach(liserveto::Response& response);
-    ~RequestCompletion() {
-        cleanup->complete([lifetime = lifetime.clone(), elapsed = started.elapsed()] {
-            lifetime.event_.finish({ liserveto::ResponseOutcome::Cancelled, {}, elapsed });
+    void finish(liserveto::ResponseOutcome outcome) {
+        cleanup->complete([lifetime = lifetime.clone(), elapsed = started.elapsed(), outcome] {
+            lifetime.event_.finish({ outcome, {}, elapsed });
         });
     }
+    ~RequestCompletion() { finish(liserveto::ResponseOutcome::Cancelled); }
 };

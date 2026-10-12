@@ -176,7 +176,9 @@ enum class ErrorKind
     InvalidRequest,
     Body,
     Cancelled,
-    Internal
+    Internal,
+    // Terminate without starting a response when the request connection has failed.
+    Connection
 };
 struct Error {
     ErrorKind         kind;

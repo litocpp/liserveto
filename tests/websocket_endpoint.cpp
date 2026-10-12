@@ -39,15 +39,18 @@ struct EndpointSocket {
     }
 };
 
-auto managed_endpoint_socket(bool force, bool embedded = false) -> coro<bool> {
+auto managed_endpoint_socket(bool force, bool embedded = false, bool delayed_cleanup = false)
+    -> coro<bool> {
     auto listener =
         rstd::net::TcpListener::bind(rstd::net::SocketAddr::ipv4_loopback(u16())).unwrap();
-    auto                    address   = listener.local_addr().unwrap();
-    auto                    stop      = Shutdown::make().unwrap();
-    auto                    entered   = Shutdown::make().unwrap();
-    int                     dropped   = 0;
-    int                     completed = 0;
-    int                     released  = 0;
+    auto                    address         = listener.local_addr().unwrap();
+    auto                    stop            = Shutdown::make().unwrap();
+    auto                    entered         = Shutdown::make().unwrap();
+    auto                    handler_waiting = Shutdown::make().unwrap();
+    auto                    handler_release = Shutdown::make().unwrap();
+    int                     dropped         = 0;
+    int                     completed       = 0;
+    int                     released        = 0;
     Option<RequestLifetime> lifetime;
     Router                  routes;
     routes
@@ -88,6 +91,10 @@ auto managed_endpoint_socket(bool force, bool embedded = false) -> coro<bool> {
                          if (sent.is_err() || sent->is_err()) co_return Err(BodyError::Io);
                          if ((co_await rstd::stream::next(messages)).is_some())
                              co_return Err(BodyError::Protocol);
+                         if (delayed_cleanup) {
+                             handler_waiting.request_stop().unwrap();
+                             co_await handler_release.notified();
+                         }
                          co_return Ok(empty {});
                      });
                  if (response.is_err())
@@ -104,7 +111,8 @@ auto managed_endpoint_socket(bool force, bool embedded = false) -> coro<bool> {
              }))
         .unwrap();
     ServerLimits limits;
-    limits.shutdown_timeout = rstd::time::Duration::from_millis(u64(2));
+    limits.shutdown_timeout = delayed_cleanup ? rstd::time::Duration::from_secs(u64(1))
+                                              : rstd::time::Duration::from_millis(u64(2));
     auto endpoint           = rstd::sync::Arc<Endpoint>::make(rstd::move(routes).into_endpoint());
     Option<rstd::async::AbortOnDropHandle<Result<ServerReport, rstd::io::error::Error>>> server;
     Option<ConnectionTask>                                                               connection;
@@ -190,6 +198,15 @@ auto managed_endpoint_socket(bool force, bool embedded = false) -> coro<bool> {
         }
     }
     if ((co_await entered.notified()).is_err()) co_return false;
+    if (delayed_cleanup) {
+        if ((co_await handler_waiting.notified()).is_err()) co_return false;
+        stop.request_stop().unwrap();
+        for (int index = 0; index < 8; ++index) co_await rstd::async::yield_now();
+        EXPECT_EQ(dropped, 0);
+        EXPECT_EQ(completed, 0);
+        EXPECT_TRUE(lifetime->report().is_none());
+        handler_release.request_stop().unwrap();
+    }
     if (! force) {
         auto completed = co_await lifetime->finished();
         if (completed.is_err() || completed->outcome != ResponseOutcome::Complete) co_return false;
@@ -252,6 +269,14 @@ TEST(WebSocketEndpoint, EmbeddedTaskCompletesUpgradeAndReleasesTransport) {
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
     auto result  = runtime.block_on(
         rstd::async::timeout(rstd::async::into_future(managed_endpoint_socket(false, true)),
+                             rstd::time::Duration::from_secs(u64(2))));
+    ASSERT_TRUE(result.is_ok());
+    EXPECT_TRUE(*result);
+}
+TEST(WebSocketEndpoint, ShutdownWaitsForHandlerAfterCloseCompletes) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto result  = runtime.block_on(
+        rstd::async::timeout(rstd::async::into_future(managed_endpoint_socket(false, false, true)),
                              rstd::time::Duration::from_secs(u64(2))));
     ASSERT_TRUE(result.is_ok());
     EXPECT_TRUE(*result);

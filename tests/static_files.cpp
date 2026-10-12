@@ -223,6 +223,67 @@ TEST(StaticFiles, InvalidConfigurationAndDisabledIndex) {
         static_exchange(runtime, endpoint, "/.env"_str).as_str().ends_with("\r\n\r\nvisible"_str));
 }
 
+TEST(StaticFiles, NavigationRequiresSpaAndUsesRouterParametersWithoutRewritingTarget) {
+    auto temporary = rstd::fs::TempDir::make("liserveto-static-navigation"_str).unwrap();
+    auto base      = rstd::path::PathBuf::from(temporary.path());
+    rstd::fs::write(base.join("index.html"_str).as_path(), "spa"_bytes).unwrap();
+    rstd::fs::create_dir_all(base.join("chat"_str).as_path()).unwrap();
+    rstd::fs::write(base.join("chat/existing"_str).as_path(), "file"_bytes).unwrap();
+    rstd::fs::soft_link("../index.html"_str, base.join("chat/denied"_str).as_path()).unwrap();
+    rstd::fs::create_dir(base.join("chat/empty"_str).as_path()).unwrap();
+    auto plain = StaticFiles::make(ConfinedDir::open(base.as_path()).unwrap()).unwrap();
+    EXPECT_TRUE(plain.navigation_endpoint().is_err());
+    StaticFilesOptions options;
+    options.spa.insert(SpaFallback {});
+    auto files =
+        StaticFiles::make(ConfinedDir::open(base.as_path()).unwrap(), rstd::move(options)).unwrap();
+    auto   navigation = files.navigation_endpoint().unwrap();
+    Router site;
+    site.get("/chat/{chat_id}"_str, navigation.clone()).unwrap();
+    site.get("/project/{project_id}/chat/{session_id}"_str, navigation.clone()).unwrap();
+    site.fallback(files.endpoint());
+    Router routes;
+    routes.nest("/site"_str, rstd::move(site)).unwrap();
+    auto endpoint = rstd::move(routes).into_endpoint();
+    auto runtime  = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto page     = static_exchange(runtime, endpoint, "/site/chat/a%20b?view=1"_str);
+    EXPECT_TRUE(page.as_str().ends_with("\r\n\r\nspa"_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/site/project/p/chat/s"_str)
+                    .as_str()
+                    .ends_with("\r\n\r\nspa"_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/site/chat/existing"_str)
+                    .as_str()
+                    .ends_with("\r\n\r\nfile"_str));
+    for (auto path : array<ref<str>, 3> {
+             "/site/chat/empty"_str, "/site/missing.js"_str, "/site/api/missing"_str })
+        EXPECT_TRUE(
+            static_exchange(runtime, endpoint, path).as_str().contains("HTTP/1.1 404 "_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/site/chat/denied"_str)
+                    .as_str()
+                    .contains("HTTP/1.1 403 "_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/site/chat/a%2fb"_str)
+                    .as_str()
+                    .contains("HTTP/1.1 400 "_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/site/chat/.hidden"_str)
+                    .as_str()
+                    .contains("HTTP/1.1 404 "_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/site/chat/id"_str, "POST"_str)
+                    .as_str()
+                    .contains("HTTP/1.1 405 "_str));
+    auto head = static_exchange(runtime, endpoint, "/site/chat/id"_str, "HEAD"_str);
+    EXPECT_TRUE(head.as_str().contains("Content-Length: 3\r\n"_str));
+    EXPECT_TRUE(head.as_str().ends_with("\r\n\r\n"_str));
+    auto range = static_exchange(
+        runtime, endpoint, "/site/chat/id"_str, "GET"_str, "Range: bytes=1-2\r\n"_str);
+    EXPECT_TRUE(range.as_str().contains("HTTP/1.1 206 "_str));
+    EXPECT_TRUE(range.as_str().ends_with("\r\n\r\npa"_str));
+    auto condition = rstd::format("If-None-Match: {}\r\n", static_tag(page.as_str()));
+    EXPECT_TRUE(
+        static_exchange(runtime, endpoint, "/site/chat/id"_str, "GET"_str, condition.as_str())
+            .as_str()
+            .contains("HTTP/1.1 304 "_str));
+}
+
 struct BlockingFileGate {
     rstd::sync::atomic::Atomic<bool>           entered { false }, release { false };
     rstd::sync::atomic::Atomic<int>            descriptor { -1 };

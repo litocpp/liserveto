@@ -65,6 +65,20 @@ auto run_request_blocking(Option<rstd::sync::Arc<ConnectionCleanup>> cleanup, F 
 export namespace liserveto
 {
 class Router;
+class Request;
+class RequestCleanup {
+    friend class Request;
+    rstd::sync::Arc<ConnectionCleanup> owner_;
+    explicit RequestCleanup(rstd::sync::Arc<ConnectionCleanup> owner): owner_(rstd::move(owner)) {}
+
+public:
+    auto clone() const -> RequestCleanup { return RequestCleanup(owner_.clone()); }
+    // Register owned, empty-output futures before request completion; drop is not a drain.
+    template<class F>
+    void defer(F future) const {
+        owner_->defer(rstd::move(future));
+    }
+};
 struct RouteParameter {
     String  name;
     Vec<u8> value;
@@ -108,6 +122,16 @@ public:
         co_return co_await body->collect(limit);
     }
     auto head() const -> const lihttpto::RequestHead& { return head_; }
+    auto cleanup() const -> rstd::io::Result<RequestCleanup> {
+        if (cleanup_.is_some()) {
+            auto owner = cleanup_->upgrade();
+            if (owner) {
+                return Ok(RequestCleanup(rstd::move(owner)));
+            }
+        }
+        return Err(rstd::io::error::Error::from_kind(
+            rstd::io::error::ErrorKind { rstd::io::error::ErrorKind::NotConnected }));
+    }
     // The closure must own its inputs; connection cleanup waits for cancelled blocking work.
     template<class F>
     auto run_blocking(F function) const -> rstd::async::coro<
