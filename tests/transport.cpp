@@ -91,6 +91,47 @@ TEST(Transport, WriteFailurePreservesCauseAndClosesConnection) {
     EXPECT_TRUE(runtime.block_on(failed_write(wire.clone())));
 }
 
+TEST(RepresentationResponse, EndpointKeepsPartialHeadAndNotModifiedResponsesDelimited) {
+    using namespace liserveto;
+    auto wire   = rstd::sync::Arc<MemoryWire>::make();
+    wire->input = Bytes::copy_from_slice(
+        "GET /file HTTP/1.1\r\nHost: x\r\nRange: bytes=2-4\r\n\r\n"
+        "HEAD /file HTTP/1.1\r\nHost: x\r\nRange: bytes=2-4\r\n\r\n"
+        "GET /file HTTP/1.1\r\nHost: x\r\nIf-None-Match: W/\"content\"\r\nConnection: close\r\n\r\n"_bytes);
+    int  requests {}, sources {};
+    auto endpoint = Endpoint::make([&](Request request) -> rstd::async::coro<ResponseResult> {
+        ++requests;
+        auto conditions = lihttpto::RequestConditions::parse(request.head().headers).unwrap();
+        lihttpto::RepresentationMetadata metadata;
+        metadata.length = u64(10);
+        metadata.etag   = Some(lihttpto::EntityTag::parse("\"content\""_bytes).unwrap());
+        co_return Ok(representation_response(
+            request.head().line.method.as_str(),
+            conditions,
+            metadata,
+            [&](lihttpto::ByteRange range) {
+                ++sources;
+                auto bytes = "0123456789"_bytes;
+                return Body::from_bytes(Bytes::copy_from_slice(
+                    slice<u8>::from_raw_parts(bytes.as_raw_ptr() + range.offset.to_primitive(),
+                                              usize(range.length.to_primitive()))));
+            }));
+    });
+    auto owner    = rstd::sync::Arc<Endpoint>::make(rstd::move(endpoint));
+    auto runtime  = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    EXPECT_TRUE(runtime.block_on(serve_connection(
+        MemoryIO { wire.clone() }, rstd::move(owner), Shutdown::make().unwrap(), {})));
+    EXPECT_EQ(requests, 3);
+    EXPECT_EQ(sources, 1);
+    auto output = rstd::str_::from_utf8(wire->output.as_slice()).unwrap();
+    EXPECT_TRUE(output.contains("HTTP/1.1 206 "_str));
+    EXPECT_TRUE(output.contains("content-range: bytes 2-4/10\r\n"_str));
+    EXPECT_TRUE(output.contains("\r\n\r\n234HTTP/1.1 200 "_str));
+    EXPECT_TRUE(output.contains("Content-Length: 10\r\n"_str));
+    EXPECT_TRUE(output.contains("\r\n\r\nHTTP/1.1 304 "_str));
+    EXPECT_TRUE(output.ends_with("Connection: close\r\n\r\n"_str));
+}
+
 auto owned_memory_connection(int mode) -> rstd::async::coro<bool> {
     using namespace liserveto;
     auto wire   = rstd::sync::Arc<MemoryWire>::make();

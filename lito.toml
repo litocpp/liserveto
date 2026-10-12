@@ -27,7 +27,7 @@ rstd-nostd = { version = "0.1.7", usage = "link" }
 
 [[test]]
 name = "liserveto-tests"
-sources = ["tests/main.cpp", "tests/body.cpp", "tests/connection.cpp", "tests/server.cpp", "tests/response.cpp", "tests/websocket.cpp", "tests/transport.cpp", "tests/confined_dir.cpp", "tests/endpoint.cpp", "tests/router.cpp", "tests/json.cpp", "tests/lifecycle.cpp", "tests/sse.cpp", "tests/websocket_endpoint.cpp"]
+sources = ["tests/main.cpp", "tests/body.cpp", "tests/connection.cpp", "tests/server.cpp", "tests/response.cpp", "tests/websocket.cpp", "tests/transport.cpp", "tests/confined_dir.cpp", "tests/representation.cpp", "tests/endpoint.cpp", "tests/router.cpp", "tests/json.cpp", "tests/lifecycle.cpp", "tests/sse.cpp", "tests/websocket_endpoint.cpp"]
 link-stdlib = false
 
 [profile.base]
