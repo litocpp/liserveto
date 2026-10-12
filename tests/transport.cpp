@@ -481,3 +481,70 @@ TEST(EndpointUpgrade, DiscardInvalidMetadataAndPartialWriteNeverActivateAction) 
         if (mode == 2) EXPECT_EQ(wire->output.len(), usize(8));
     }
 }
+
+#ifdef LITO_FEAT_WEBSOCKET
+TEST(WebSocketEndpoint, ValidatesFinalHandshakeBeforeWritingOrStartingDriver) {
+    using namespace liserveto;
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    for (int mode = 0; mode < 8; ++mode) {
+        auto wire   = rstd::sync::Arc<MemoryWire>::make();
+        wire->input = Bytes::copy_from_slice(
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: one, two\r\n\r\n"_str
+                .as_bytes());
+        int  activated = 0, notified = 0;
+        auto endpoint = Endpoint::make([&](Request request) -> rstd::async::coro<ResponseResult> {
+            auto upgrade  = WebSocketUpgrade::from_request(request, Some("one"_str)).unwrap();
+            auto response = rstd::move(upgrade)
+                                .accept([&](WebSocket&, Shutdown, RequestLifetime)
+                                            -> rstd::async::coro<Result<empty, BodyError>> {
+                                    ++activated;
+                                    co_return Ok(empty {});
+                                })
+                                .unwrap();
+            switch (mode) {
+            case 0:
+                response.head.headers.set("Sec-WebSocket-Accept"_str, "wrong"_str).unwrap();
+                break;
+            case 1: response.head.headers.remove("Sec-WebSocket-Accept"_str); break;
+            case 2:
+                response.head.headers
+                    .add("Sec-WebSocket-Accept"_str, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="_str)
+                    .unwrap();
+                break;
+            case 3:
+                response.head.headers.set("Sec-WebSocket-Protocol"_str, "two"_str).unwrap();
+                break;
+            case 4: response.head.headers.remove("Sec-WebSocket-Protocol"_str); break;
+            case 5:
+                response.head.headers.add("Sec-WebSocket-Extensions"_str, "permessage-deflate"_str)
+                    .unwrap();
+                break;
+            case 6:
+                response.head.headers.add("Sec-WebSocket-Protocol"_str, "one"_str).unwrap();
+                break;
+            case 7: response.head.headers.add("X-Final"_str, "yes"_str).unwrap(); break;
+            }
+            response.on_finish([&](const ResponseReport& report) {
+                EXPECT_EQ(report.outcome,
+                          mode == 7 ? ResponseOutcome::Complete : ResponseOutcome::SourceError);
+                ++notified;
+            });
+            co_return Ok(rstd::move(response));
+        });
+        EXPECT_EQ(
+            runtime.block_on(serve_connection(MemoryIO { wire.clone() },
+                                              rstd::sync::Arc<Endpoint>::make(rstd::move(endpoint)),
+                                              Shutdown::make().unwrap(),
+                                              {})),
+            mode == 7);
+        EXPECT_EQ(activated, mode == 7 ? 1 : 0);
+        EXPECT_EQ(notified, 1);
+        if (mode == 7)
+            EXPECT_TRUE(rstd::str_::from_utf8(wire->output.as_slice())
+                            .unwrap()
+                            .contains("X-Final: yes\r\n"_str));
+        else
+            EXPECT_TRUE(wire->output.is_empty());
+    }
+}
+#endif

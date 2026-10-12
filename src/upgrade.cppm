@@ -101,17 +101,28 @@ struct UpgradeAction {
     template<class Self, class Delegate = void>
     struct Api {
         using Trait = UpgradeAction;
+        auto validate_response(const lihttpto::ResponseHead& head)
+            -> Result<empty, liserveto::BodyError> {
+            return rstd::trait_call<0>(this, head);
+        }
         auto run(liserveto::UpgradedStream stream, Arc<ConnectionCleanup> cleanup)
             -> rstd::async::coro<Result<empty, liserveto::BodyError>> {
-            return rstd::trait_call<0>(this, rstd::move(stream), rstd::move(cleanup));
+            return rstd::trait_call<1>(this, rstd::move(stream), rstd::move(cleanup));
         }
     };
     template<class S>
-    using Funcs = TraitFuncs<&S::run>;
+    using Funcs = TraitFuncs<&S::validate_response, &S::run>;
 };
 template<class H>
 struct StoredUpgradeAction {
     H    handler;
+    auto validate_response(const lihttpto::ResponseHead& head)
+        -> Result<empty, liserveto::BodyError> {
+        if constexpr (requires { handler.validate_response(head); })
+            return handler.validate_response(head);
+        else
+            return Ok(empty {});
+    }
     auto run(liserveto::UpgradedStream stream, Arc<ConnectionCleanup> cleanup)
         -> rstd::async::coro<Result<empty, liserveto::BodyError>> {
         co_return co_await handler(rstd::move(stream), rstd::move(cleanup));

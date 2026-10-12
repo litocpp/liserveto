@@ -191,48 +191,59 @@ public:
         if (io_timeout.is_zero() || options.receive_messages == usize() ||
             options.receive_bytes == usize())
             return Err(HandshakeError::Upgrade);
-        auto action = [handler = rstd::move(handler),
-                       options,
-                       io_timeout,
-                       protocol = handshake_.protocol().clone(),
-                       shutdown = shutdown_.clone(),
-                       lifetime = lifetime_.clone()](
-                          UpgradedStream stream, rstd::sync::Arc<ConnectionCleanup> cleanup) mutable
-            -> coro<Result<empty, BodyError>> {
-            auto driver = WebSocketConnection<UpgradedTransport>::start(
-                UpgradedTransport { rstd::move(stream), Shutdown::make().unwrap(), io_timeout },
-                Role::Server,
-                options,
-                rstd::move(protocol));
-            if (driver.is_err()) co_return Err(BodyError::Io);
-            WebSocket socket(rstd::move(driver).unwrap(), rstd::move(cleanup));
-            auto      invoke = [&]() -> coro<Result<empty, BodyError>> {
-                co_return co_await handler(socket, shutdown.clone(), lifetime.clone());
-            };
-            auto pending = Some(rstd::async::into_future(invoke()));
-            auto selected =
-                co_await rstd::async::select(shutdown.notified(), rstd::future::by_ref(*pending));
-            Result<empty, BodyError> result = Err(BodyError::Cancelled);
-            if (selected.is_right())
-                result = rstd::move(selected).unwrap_right();
-            else {
-                auto closing = socket.close();
-                auto waited  = co_await rstd::async::timeout(
-                    rstd::async::select(rstd::future::by_ref(closing),
-                                        rstd::future::by_ref(*pending)),
-                    options.close_timeout);
-                if (waited.is_ok() && waited->is_right())
-                    result = rstd::move(*waited).unwrap_right();
+        struct Action {
+            H                    handler;
+            WebSocketOptions     options;
+            rstd::time::Duration io_timeout;
+            ServerHandshake      handshake;
+            Shutdown             shutdown;
+            RequestLifetime      lifetime;
+            auto                 validate_response(const lihttpto::ResponseHead& head) const
+                -> Result<empty, BodyError> {
+                if (handshake.validate_response_headers(head.headers).is_err())
+                    return Err(BodyError::Protocol);
+                return Ok(empty {});
             }
-            pending = None();
-            co_await socket.shutdown();
-            co_return result;
+            auto operator()(UpgradedStream stream, rstd::sync::Arc<ConnectionCleanup> cleanup)
+                -> coro<Result<empty, BodyError>> {
+                auto driver = WebSocketConnection<UpgradedTransport>::start(
+                    UpgradedTransport { rstd::move(stream), Shutdown::make().unwrap(), io_timeout },
+                    Role::Server,
+                    options,
+                    handshake.protocol().clone());
+                if (driver.is_err()) co_return Err(BodyError::Io);
+                WebSocket socket(rstd::move(driver).unwrap(), rstd::move(cleanup));
+                auto      invoke = [&]() -> coro<Result<empty, BodyError>> {
+                    co_return co_await handler(socket, shutdown.clone(), lifetime.clone());
+                };
+                auto pending  = Some(rstd::async::into_future(invoke()));
+                auto selected = co_await rstd::async::select(shutdown.notified(),
+                                                             rstd::future::by_ref(*pending));
+                Result<empty, BodyError> result = Err(BodyError::Cancelled);
+                if (selected.is_right())
+                    result = rstd::move(selected).unwrap_right();
+                else {
+                    auto closing = socket.close();
+                    auto waited  = co_await rstd::async::timeout(
+                        rstd::async::select(rstd::future::by_ref(closing),
+                                            rstd::future::by_ref(*pending)),
+                        options.close_timeout);
+                    if (waited.is_ok() && waited->is_right())
+                        result = rstd::move(*waited).unwrap_right();
+                }
+                pending = None();
+                co_await socket.shutdown();
+                co_return result;
+            }
         };
+        auto headers = handshake_.headers().clone();
+        auto action  = Action { rstd::move(handler),    options,           io_timeout,
+                                rstd::move(handshake_), shutdown_.clone(), lifetime_.clone() };
         auto response =
             Response::on_upgrade(rstd::move(permit_),
                                  lihttpto::UpgradeProtocol::make("websocket"_str).unwrap(),
                                  rstd::move(action),
-                                 handshake_.headers());
+                                 headers);
         if (response.is_err()) return Err(HandshakeError::Upgrade);
         return Ok(rstd::move(response).unwrap());
     }

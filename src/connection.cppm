@@ -376,6 +376,13 @@ public:
                 transfer.finish(ResponseOutcome::SourceError);
                 co_return Err(connection_error(ConnectionErrorKind::State));
             }
+            auto validated = plan.action->validate_response(response.head);
+            if (validated.is_err()) {
+                close();
+                transfer.finish(ResponseOutcome::SourceError);
+                co_return Err(ConnectionError {
+                    ConnectionErrorKind::Body, {}, {}, {}, Some(validated.unwrap_err()) });
+            }
             auto head = (*upgrade_)->encode_response(
                 plan.protocol, response.head, limits_.head.total_bytes);
             if (head.is_err()) {
