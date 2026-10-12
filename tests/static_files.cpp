@@ -1,6 +1,6 @@
 #include <rstd/test/gtest.hpp>
 #include <rstd/macro.hpp>
-#if RSTD_OS_LINUX
+#if RSTD_OS_UNIX
 #include <fcntl.h>
 #include <sys/stat.h>
 #endif
@@ -14,7 +14,7 @@ using rstd::task::Context;
 using rstd::task::Poll;
 using rstd::sync::Arc;
 
-#if RSTD_OS_LINUX
+#if RSTD_OS_LINUX || (RSTD_OS_MACOS && defined(O_RESOLVE_BENEATH) && defined(O_NOFOLLOW_ANY))
 struct StaticWire {
     Bytes    input;
     BytesMut output;

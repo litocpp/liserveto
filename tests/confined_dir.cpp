@@ -1,6 +1,6 @@
 #include <rstd/test/gtest.hpp>
 #include <rstd/macro.hpp>
-#if RSTD_OS_LINUX
+#if RSTD_OS_UNIX
 #include <fcntl.h>
 #include <sys/stat.h>
 #endif
@@ -10,8 +10,11 @@ using namespace rstd::prelude;
 using namespace rstd::literals;
 using liserveto::ConfinedDir;
 
-#if RSTD_OS_LINUX
+#if RSTD_OS_LINUX || (RSTD_OS_MACOS && defined(O_RESOLVE_BENEATH) && defined(O_NOFOLLOW_ANY))
 TEST(ConfinedDir, ReadOnlyPathsLinksAndStableHandles) {
+#if RSTD_OS_MACOS
+    ASSERT_TRUE(ConfinedDir::open("/"_str).is_ok());
+#endif
     auto temporary  = rstd::fs::TempDir::make("liserveto-confined"_str).unwrap();
     auto base       = rstd::path::PathBuf::from(temporary.path().as_os_str().to_os_string());
     auto root_path  = base.join("root"_str);

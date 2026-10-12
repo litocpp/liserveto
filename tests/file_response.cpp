@@ -1,6 +1,6 @@
 #include <rstd/test/gtest.hpp>
 #include <rstd/macro.hpp>
-#if RSTD_OS_LINUX
+#if RSTD_OS_UNIX
 #include <fcntl.h>
 #endif
 import liserveto;
@@ -12,7 +12,7 @@ using rstd::bytes::BytesMut;
 using rstd::task::Context;
 using rstd::task::Poll;
 
-#if RSTD_OS_LINUX
+#if RSTD_OS_LINUX || (RSTD_OS_MACOS && defined(O_RESOLVE_BENEATH) && defined(O_NOFOLLOW_ANY))
 auto file_path(const rstd::fs::TempDir& directory) -> rstd::path::PathBuf {
     return rstd::path::PathBuf::from(directory.path().as_os_str().to_os_string()).join("file"_str);
 }
