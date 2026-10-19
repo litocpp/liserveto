@@ -16,14 +16,14 @@ default = false
 default = false
 
 [dependencies]
-lihttpto = { version = "0.1.0", pub = true }
-rstd-std = { version = "0.1.7", pub = true }
+lihttpto = { version = "0.1.1", pub = true }
+rstd-std = { version = "0.1.9", pub = true }
 liwebsocketo = { version = "0.1.0", pub = true, condition = "feature.websocket" }
-rstd-json = { version = "0.1.7", pub = true, condition = "feature.json" }
+rstd-json = { version = "0.1.9", pub = true, condition = "feature.json" }
 
 [dev-dependencies]
-rstd-test = { version = "0.1.7" }
-rstd-nostd = { version = "0.1.7", usage = "link" }
+rstd-test = { version = "0.1.9" }
+rstd-nostd = { version = "0.1.9", usage = "link" }
 
 [[test]]
 name = "liserveto-tests"
