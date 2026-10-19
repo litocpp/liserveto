@@ -1,9 +1,0 @@
-<release version="0.1.0" date="2026-10-20">
-  <description>
-    <ul>
-      <li>Add HTTP endpoints, routing, request cleanup and static files.</li>
-      <li>Support WebSocket upgrades and server-sent events.</li>
-      <li>Use lihttpto 0.1.1, liwebsocketo 0.1.0 and rstd 0.1.9.</li>
-    </ul>
-  </description>
-</release>
