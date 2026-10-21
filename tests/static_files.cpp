@@ -69,6 +69,69 @@ auto static_tag(ref<str> response) -> String {
     }
     return {};
 }
+#ifdef LITO_FEAT_RESOURCES
+static constexpr unsigned char embedded_data[] =
+    "index.htmlhome"
+    "1111111111111111111111111111111111111111111111111111111111111111"
+    "main.jsscript"
+    "sub/file.txtchild";
+static constexpr liresto::ResourceIndex embedded_index[] = {
+    { usize(0), usize(10), usize(10), usize(4), usize(14), usize(64) },
+    { usize(78), usize(7), usize(85), usize(6), usize(14), usize(64) },
+    { usize(91), usize(12), usize(103), usize(5), usize(14), usize(64) },
+};
+TEST(StaticFiles, EmbeddedResourcesReuseHttpPolicy) {
+    auto bundle =
+        liresto::ResourceBundle::from_static<embedded_data, embedded_index>(usize(3)).unwrap();
+    StaticFilesOptions options;
+    options.spa = Some(SpaFallback {});
+    options.spa->routes.push("view"_Str);
+    auto files    = StaticFiles::make(rstd::move(bundle), rstd::move(options)).unwrap();
+    auto endpoint = files.endpoint();
+    auto runtime  = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto home     = static_exchange(runtime, endpoint, "/"_str);
+    EXPECT_TRUE(home.as_str().ends_with("\r\n\r\nhome"_str));
+    EXPECT_TRUE(home.as_str().contains("content-type: text/html; charset=utf-8"_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/main.js?v=1"_str)
+                    .as_str()
+                    .ends_with("\r\n\r\nscript"_str));
+    auto tag         = static_tag(home.as_str());
+    auto conditional = rstd::format("If-None-Match: {}\r\n", tag);
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/"_str, "GET"_str, conditional.as_str())
+                    .as_str()
+                    .contains("HTTP/1.1 304 "_str));
+    auto partial =
+        static_exchange(runtime, endpoint, "/main.js"_str, "GET"_str, "Range: bytes=1-3\r\n"_str);
+    EXPECT_TRUE(partial.as_str().contains("HTTP/1.1 206 "_str));
+    EXPECT_TRUE(partial.as_str().ends_with("\r\n\r\ncri"_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/main.js"_str, "HEAD"_str)
+                    .as_str()
+                    .ends_with("\r\n\r\n"_str));
+    EXPECT_TRUE(
+        static_exchange(runtime, endpoint, "/main.js"_str, "GET"_str, "Range: bytes=99-\r\n"_str)
+            .as_str()
+            .contains("HTTP/1.1 416 "_str));
+    EXPECT_TRUE(
+        static_exchange(runtime, endpoint, "/view"_str).as_str().ends_with("\r\n\r\nhome"_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/api/missing"_str)
+                    .as_str()
+                    .contains("HTTP/1.1 404 "_str));
+    EXPECT_TRUE(
+        static_exchange(runtime, endpoint, "/main.js/"_str).as_str().contains("HTTP/1.1 404 "_str));
+    EXPECT_TRUE(static_exchange(runtime, endpoint, "/%2e%2e/main.js"_str)
+                    .as_str()
+                    .contains("HTTP/1.1 400 "_str));
+    auto navigation = files.navigation_endpoint().unwrap();
+    EXPECT_TRUE(static_exchange(runtime, navigation, "/missing/"_str)
+                    .as_str()
+                    .ends_with("\r\n\r\nhome"_str));
+    EXPECT_TRUE(
+        static_exchange(runtime, navigation, "/sub/"_str).as_str().contains("HTTP/1.1 404 "_str));
+    EXPECT_TRUE(static_exchange(runtime, navigation, "/main.js/"_str)
+                    .as_str()
+                    .contains("HTTP/1.1 404 "_str));
+}
+#endif
 TEST(StaticFiles, MountIndexMimeAndSingleDecodedPath) {
     auto temporary = rstd::fs::TempDir::make("liserveto-static"_str).unwrap();
     auto base      = rstd::path::PathBuf::from(temporary.path());

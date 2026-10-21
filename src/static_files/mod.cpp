@@ -10,10 +10,15 @@ using IoErrorKind = rstd::io::error::ErrorKind;
 using rstd::sync::Arc;
 
 struct StaticFilesState {
-    ConfinedDir        root;
-    StaticFilesOptions options;
+    Option<ConfinedDir> root;
+    StaticFilesOptions  options;
     StaticFilesState(ConfinedDir root, StaticFilesOptions options)
-        : root(rstd::move(root)), options(rstd::move(options)) {}
+        : root(Some(rstd::move(root))), options(rstd::move(options)) {}
+#ifdef LITO_FEAT_RESOURCES
+    Option<liresto::ResourceBundle> resources;
+    StaticFilesState(liresto::ResourceBundle bundle, StaticFilesOptions options)
+        : options(rstd::move(options)), resources(Some(rstd::move(bundle))) {}
+#endif
 };
 auto valid_static_segment(slice<u8> segment) -> bool {
     if (segment.is_empty() || segment == "."_bytes || segment == ".."_bytes) return false;
@@ -108,13 +113,13 @@ auto prepare_static_file(const StaticFilesState& state, StaticPath path, bool fa
     -> rstd::io::Result<PreparedStaticFile> {
     auto relative =
         rstd::path::PathBuf::from(path.relative.is_empty() ? "."_str : path.relative.as_str());
-    auto opened = state.root.open_entry(relative.as_path());
+    auto opened = state.root->open_entry(relative.as_path());
     if (opened.is_err()) {
         if (! fallback || ! missing_static_entry(opened.unwrap_err()))
             return Err(rstd::move(opened).unwrap_err());
         auto name   = state.options.spa->file.clone();
         auto native = rstd::path::PathBuf::from(name.as_str());
-        auto entry  = rstd_try(state.root.open_entry(native.as_path()));
+        auto entry  = rstd_try(state.root->open_entry(native.as_path()));
         return Ok(PreparedStaticFile { rstd_try(FileResponse::prepare(rstd::move(entry))),
                                        rstd::move(name) });
     }
@@ -137,6 +142,51 @@ auto prepare_static_file(const StaticFilesState& state, StaticPath path, bool fa
     return Ok(PreparedStaticFile { rstd_try(FileResponse::prepare(rstd::move(entry))),
                                    rstd::move(path.relative) });
 }
+#ifdef LITO_FEAT_RESOURCES
+auto serve_embedded(const StaticFilesState&            state,
+                    StaticPath                         path,
+                    bool                               fallback,
+                    ref<str>                           method,
+                    const lihttpto::RequestConditions& conditions) -> ResponseResult {
+    auto& resources = *state.resources;
+    auto  name      = rstd::move(path.relative);
+    auto  directory = resources.is_directory(name.as_str());
+    if (directory) {
+        if (state.options.index.is_none()) return Ok(static_status(u16(404)));
+        if (! name.is_empty()) name.push_ascii(u8('/'));
+        name.push_str(state.options.index->as_str());
+    }
+    auto found = resources.get(name.as_str());
+    if (found.is_err()) return Ok(static_status(u16(400)));
+    auto resource = rstd::move(found).unwrap();
+    if (! directory && path.directory && resource.is_some()) return Ok(static_status(u16(404)));
+    if (resource.is_none() && fallback && ! directory) {
+        name     = state.options.spa->file.clone();
+        resource = resources.get(name.as_str()).unwrap();
+    }
+    if (resource.is_none()) return Ok(static_status(u16(404)));
+    lihttpto::RepresentationMetadata metadata;
+    metadata.length = u64(resource->len().to_primitive());
+    auto digest     = resource->digest();
+    if (digest.is_some()) {
+        auto tag      = rstd::format("\"{}\"", *digest);
+        metadata.etag = Some(lihttpto::EntityTag::parse(tag.as_str().as_bytes()).unwrap());
+    }
+    lihttpto::Headers headers;
+    headers.add("content-type"_str, static_mime(name.as_str())).unwrap();
+    headers.add("x-content-type-options"_str, "nosniff"_str).unwrap();
+    return Ok(representation_response(
+        method,
+        conditions,
+        metadata,
+        [bytes = resource->bytes()](lihttpto::ByteRange range) mutable {
+            bytes.advance(usize(range.offset.to_primitive()));
+            bytes.truncate(usize(range.length.to_primitive()));
+            return Body::from_bytes(rstd::move(bytes));
+        },
+        rstd::move(headers)));
+}
+#endif
 auto serve_static_files(Arc<StaticFilesState> state, Request request, bool navigation = false)
     -> rstd::async::coro<ResponseResult> {
     auto method = request.head().line.method.as_str();
@@ -149,6 +199,10 @@ auto serve_static_files(Arc<StaticFilesState> state, Request request, bool navig
     if (state->options.spa.is_some())
         for (const auto& route : state->options.spa->routes)
             fallback = fallback || route == path->relative;
+#ifdef LITO_FEAT_RESOURCES
+    if (state->resources.is_some())
+        co_return serve_embedded(*state, rstd::move(path).unwrap(), fallback, method, *conditions);
+#endif
     auto chunk_size = state->options.chunk_size;
     auto submitted  = co_await request.run_blocking(
         [state = state.clone(), path = rstd::move(path).unwrap(), fallback]() mutable {
@@ -165,15 +219,7 @@ auto serve_static_files(Arc<StaticFilesState> state, Request request, bool navig
     if (response.is_err()) co_return Err(Error { ErrorKind::Body, Some(response.unwrap_err()) });
     co_return Ok(rstd::move(response).unwrap());
 }
-namespace liserveto
-{
-StaticFiles::StaticFiles(Arc<StaticFilesState> state): state_(rstd::move(state)) {
-}
-StaticFiles::StaticFiles(StaticFiles&&) noexcept                    = default;
-auto StaticFiles::operator=(StaticFiles&&) noexcept -> StaticFiles& = default;
-StaticFiles::~StaticFiles()                                         = default;
-auto StaticFiles::make(ConfinedDir root, StaticFilesOptions options)
-    -> rstd::io::Result<StaticFiles> {
+auto valid_static_options(const StaticFilesOptions& options) -> bool {
     bool valid = options.chunk_size != usize() && options.chunk_size <= usize(1048576);
     if (options.index.is_some()) {
         valid = valid && valid_static_path(options.index->as_str(), options.dotfiles);
@@ -186,9 +232,29 @@ auto StaticFiles::make(ConfinedDir root, StaticFilesOptions options)
             for (auto byte : route.as_str().as_bytes()) valid = valid && byte != u8('.');
         }
     }
-    if (! valid) return Err(IoError::from_kind(IoErrorKind { IoErrorKind::InvalidInput }));
+    return valid;
+}
+namespace liserveto
+{
+StaticFiles::StaticFiles(Arc<StaticFilesState> state): state_(rstd::move(state)) {
+}
+StaticFiles::StaticFiles(StaticFiles&&) noexcept                    = default;
+auto StaticFiles::operator=(StaticFiles&&) noexcept -> StaticFiles& = default;
+StaticFiles::~StaticFiles()                                         = default;
+auto StaticFiles::make(ConfinedDir root, StaticFilesOptions options)
+    -> rstd::io::Result<StaticFiles> {
+    if (! valid_static_options(options))
+        return Err(IoError::from_kind(IoErrorKind { IoErrorKind::InvalidInput }));
     return Ok(StaticFiles(Arc<StaticFilesState>::make(rstd::move(root), rstd::move(options))));
 }
+#ifdef LITO_FEAT_RESOURCES
+auto StaticFiles::make(liresto::ResourceBundle resources, StaticFilesOptions options)
+    -> rstd::io::Result<StaticFiles> {
+    if (! valid_static_options(options))
+        return Err(IoError::from_kind(IoErrorKind { IoErrorKind::InvalidInput }));
+    return Ok(StaticFiles(Arc<StaticFilesState>::make(rstd::move(resources), rstd::move(options))));
+}
+#endif
 auto StaticFiles::endpoint() const -> Endpoint {
     return Endpoint::make([state = state_.clone()](Request request) {
         return serve_static_files(state.clone(), rstd::move(request));

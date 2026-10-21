@@ -15,11 +15,15 @@ default = false
 [features.json]
 default = false
 
+[features.resources]
+default = false
+
 [dependencies]
 lihttpto = { version = "0.1.1", pub = true }
 rstd-std = { version = "0.1.9", pub = true }
 liwebsocketo = { version = "0.1.0", pub = true, condition = "feature.websocket" }
 rstd-json = { version = "0.1.9", pub = true, condition = "feature.json" }
+liresto = { version = "0.1.0", pub = true, condition = "feature.resources" }
 
 [dev-dependencies]
 rstd-test = { version = "0.1.9" }

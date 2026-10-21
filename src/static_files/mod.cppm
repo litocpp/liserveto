@@ -1,6 +1,9 @@
 export module liserveto:static_files;
 export import :static_files.file;
 export import :endpoint;
+#ifdef LITO_FEAT_RESOURCES
+export import liresto;
+#endif
 using namespace rstd::prelude;
 using namespace rstd::literals;
 
@@ -30,6 +33,10 @@ public:
     // Open the trusted root outside the event loop; request preparation uses blocking workers.
     static auto make(ConfinedDir root, StaticFilesOptions options = {})
         -> rstd::io::Result<StaticFiles>;
+#ifdef LITO_FEAT_RESOURCES
+    static auto make(liresto::ResourceBundle resources, StaticFilesOptions options = {})
+        -> rstd::io::Result<StaticFiles>;
+#endif
     auto endpoint() const -> Endpoint;
     // Requires SPA options; register only explicit navigation routes on a Router.
     auto navigation_endpoint() const -> rstd::io::Result<Endpoint>;
