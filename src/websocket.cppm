@@ -96,7 +96,7 @@ public:
         auto prepared = http.prepare_upgrade(
             lihttpto::UpgradeProtocol::make("websocket"_str).unwrap(), handshake.headers());
         if (prepared.is_err())
-            co_return Err(ServerConnectFailure { .handshake = Some(HandshakeError::Upgrade) });
+            co_return Err(ServerConnectFailure { .handshake = Some(HandshakeError::Upgrade()) });
         auto upgraded = co_await http.upgrade(rstd::move(prepared).unwrap());
         if (upgraded.is_err())
             co_return Err(
@@ -175,7 +175,7 @@ class WebSocketUpgrade {
 public:
     static auto from_request(const Request& request, Option<ref<str>> protocol = {})
         -> Result<WebSocketUpgrade, HandshakeError> {
-        if (request.upgrade.is_none()) return Err(HandshakeError::Upgrade);
+        if (request.upgrade.is_none()) return Err(HandshakeError::Upgrade());
         auto handshake = ServerHandshake::parse(request.head(), protocol);
         if (handshake.is_err()) return Err(handshake.unwrap_err());
         return Ok(WebSocketUpgrade(request.upgrade->clone(),
@@ -190,7 +190,7 @@ public:
                     u64(30))) && -> Result<Response, HandshakeError> {
         if (io_timeout.is_zero() || options.receive_messages == usize() ||
             options.receive_bytes == usize())
-            return Err(HandshakeError::Upgrade);
+            return Err(HandshakeError::Upgrade());
         struct Action {
             H                    handler;
             WebSocketOptions     options;
@@ -243,7 +243,7 @@ public:
                                  lihttpto::UpgradeProtocol::make("websocket"_str).unwrap(),
                                  rstd::move(action),
                                  headers);
-        if (response.is_err()) return Err(HandshakeError::Upgrade);
+        if (response.is_err()) return Err(HandshakeError::Upgrade());
         return Ok(rstd::move(response).unwrap());
     }
 };
