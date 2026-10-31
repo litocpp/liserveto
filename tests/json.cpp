@@ -46,4 +46,34 @@ TEST(JsonEndpoint, ParsedValueRetainsTrailerMetadata) {
     auto    parsed  = runtime.block_on(read_json(request, u64(2))).unwrap();
     EXPECT_EQ(*parsed.trailers.get_unique_text("X-End"_str).unwrap(), "yes"_str);
 }
+TEST(JsonEndpoint, CallerParseOptionsRejectDuplicateKeysAndIntegerOverflow) {
+    auto make = [](ref<str> body) {
+        lihttpto::RequestHeadDecoder decoder;
+        decoder.feed("POST / HTTP/1.1\r\nHost: local\r\n\r\n"_str.as_bytes()).unwrap();
+        return Request(decoder.take().unwrap(),
+                       IncomingBody::from_body(
+                           Body::from_bytes(rstd::bytes::Bytes::copy_from_slice(body.as_bytes()))),
+                       Shutdown::make().unwrap());
+    };
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    rstd::json::ParseOptions strict;
+    strict.reject_duplicate_keys   = true;
+    strict.reject_integer_overflow = true;
+    auto duplicate                 = make(R"({"value":1,"value":2})"_str);
+    EXPECT_EQ(runtime.block_on(read_json(duplicate, u64(128), strict)).unwrap_err().kind,
+              ErrorKind::InvalidRequest);
+    auto overflow = make(R"({"value":18446744073709551616})"_str);
+    EXPECT_EQ(runtime.block_on(read_json(overflow, u64(128), strict)).unwrap_err().kind,
+              ErrorKind::InvalidRequest);
+    auto valid = make(R"({"value":18446744073709551615})"_str);
+    EXPECT_EQ(runtime.block_on(read_json(valid, u64(128), strict))
+                  .unwrap()
+                  .value.get("value"_str)
+                  .unwrap()
+                  ->as_u64()
+                  .unwrap(),
+              u64::MAX);
+    auto compatible = make(R"({"value":1,"value":2})"_str);
+    EXPECT_TRUE(runtime.block_on(read_json(compatible, u64(128))).is_ok());
+}
 #endif
