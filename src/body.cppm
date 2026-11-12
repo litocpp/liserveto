@@ -3,6 +3,7 @@ export import lihttpto;
 export import rstd;
 
 using namespace rstd::prelude;
+using namespace rstd::literals;
 using rstd::bytes::Bytes;
 using rstd::task::Context;
 using rstd::task::Poll;
@@ -24,6 +25,30 @@ struct CollectedBody {
     lihttpto::Headers trailers;
 };
 } // namespace liserveto
+
+export namespace rstd
+{
+template<>
+struct Impl<fmt::Display, liserveto::BodyError> : ImplBase<liserveto::BodyError> {
+    auto fmt(fmt::Formatter& f) const -> bool {
+        switch (this->self()) {
+        case liserveto::BodyError::Source: return f.write_str("HTTP body source failed"_str);
+        case liserveto::BodyError::Protocol: return f.write_str("invalid HTTP body framing"_str);
+        case liserveto::BodyError::LimitExceeded:
+            return f.write_str("HTTP body limit exceeded"_str);
+        case liserveto::BodyError::Cancelled: return f.write_str("HTTP body cancelled"_str);
+        case liserveto::BodyError::Io: return f.write_str("HTTP body I/O failed"_str);
+        case liserveto::BodyError::Timeout: return f.write_str("HTTP body timed out"_str);
+        }
+        __builtin_unreachable();
+    }
+};
+template<>
+struct Impl<fmt::Debug, liserveto::BodyError> : Impl<fmt::Display, liserveto::BodyError> {};
+template<>
+struct Impl<error::Error, liserveto::BodyError>
+    : DefaultInImpl<error::Error, liserveto::BodyError> {};
+} // namespace rstd
 
 namespace liserveto
 {
