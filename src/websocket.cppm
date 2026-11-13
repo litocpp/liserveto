@@ -1,6 +1,6 @@
 module;
-#ifdef LITO_FEAT_WEBSOCKET
 export module liserveto:websocket;
+#ifdef LITO_FEAT_WEBSOCKET
 export import :connection;
 export import :request;
 export import :shutdown;
@@ -10,6 +10,16 @@ using namespace liwebsocketo;
 using rstd::async::coro;
 using rstd::bytes::Bytes;
 
+template<class F>
+auto websocket_read_with_timeout(F reading, Option<rstd::time::Duration> idle_timeout)
+    -> coro<WebSocketResult<Bytes>> {
+    if (idle_timeout.is_none()) co_return co_await rstd::move(reading);
+    auto result =
+        co_await rstd::async::timeout(rstd::async::into_future(rstd::move(reading)), *idle_timeout);
+    if (result.is_err()) co_return Err(WebSocketError::Timeout);
+    co_return rstd::move(*result);
+}
+
 export namespace liserveto
 {
 class TcpTransport {
@@ -18,43 +28,50 @@ class TcpTransport {
     rstd::async::Notify                               cancel_read_, cancel_write_;
     rstd::sync::Arc<rstd::sync::atomic::Atomic<bool>> cancelled_;
     rstd::time::Duration                              timeout_;
-    TcpTransport(UpgradedConnection   connection,
-                 rstd::async::Notify  read,
-                 rstd::async::Notify  write,
-                 rstd::time::Duration timeout)
+    Option<rstd::time::Duration>                      idle_timeout_;
+    TcpTransport(UpgradedConnection           connection,
+                 rstd::async::Notify          read,
+                 rstd::async::Notify          write,
+                 rstd::time::Duration         timeout,
+                 Option<rstd::time::Duration> idle_timeout)
         : stream_(rstd::move(connection.stream)),
           pending_(rstd::move(connection.pending)),
           cancel_read_(rstd::move(read)),
           cancel_write_(rstd::move(write)),
           cancelled_(rstd::sync::Arc<rstd::sync::atomic::Atomic<bool>>::make(false)),
-          timeout_(timeout) {}
+          timeout_(timeout),
+          idle_timeout_(idle_timeout) {}
 
 public:
     TcpTransport(TcpTransport&&) noexcept = default;
     static auto make(UpgradedConnection   connection,
-                     rstd::time::Duration timeout = rstd::time::Duration::from_secs(u64(30)))
+                     rstd::time::Duration timeout = rstd::time::Duration::from_secs(u64(30)),
+                     Option<rstd::time::Duration> idle_timeout = {})
         -> WebSocketResult<TcpTransport> {
-        if (timeout.is_zero()) return Err(WebSocketError::Timeout);
+        if (timeout.is_zero() || (idle_timeout.is_some() && idle_timeout->is_zero()))
+            return Err(WebSocketError::Timeout);
         auto read  = rstd::async::Notify::make();
         auto write = rstd::async::Notify::make();
         if (read.is_err() || write.is_err()) return Err(WebSocketError::Transport);
         return Ok(TcpTransport(rstd::move(connection),
                                rstd::move(read).unwrap(),
                                rstd::move(write).unwrap(),
-                               timeout));
+                               timeout,
+                               idle_timeout));
     }
     auto read() -> coro<WebSocketResult<Bytes>> {
         if (cancelled_->load()) co_return Err(WebSocketError::Cancelled);
         if (! pending_.is_empty()) co_return Ok(rstd::exchange(pending_, Bytes {}));
-        auto buffer = rstd::bytes::BytesMut::with_capacity(usize(16384));
-        auto result = co_await rstd::async::timeout(
-            rstd::async::select(rstd::async::io::read(stream_, buffer), cancel_read_.notified()),
-            timeout_);
-        if (result.is_err()) co_return Err(WebSocketError::Timeout);
-        auto selected = rstd::move(result).unwrap();
-        if (selected.is_right()) co_return Err(WebSocketError::Cancelled);
-        if (rstd::move(selected).unwrap_left().is_err()) co_return Err(WebSocketError::Transport);
-        co_return Ok(Bytes::copy_from_slice(buffer.as_slice()));
+        auto reading = [&]() -> coro<WebSocketResult<Bytes>> {
+            auto buffer   = rstd::bytes::BytesMut::with_capacity(usize(16384));
+            auto selected = co_await rstd::async::select(rstd::async::io::read(stream_, buffer),
+                                                         cancel_read_.notified());
+            if (selected.is_right()) co_return Err(WebSocketError::Cancelled);
+            if (rstd::move(selected).unwrap_left().is_err())
+                co_return Err(WebSocketError::Transport);
+            co_return Ok(Bytes::copy_from_slice(buffer.as_slice()));
+        };
+        co_return co_await websocket_read_with_timeout(reading(), idle_timeout_);
     }
     auto write(Bytes bytes) -> coro<WebSocketResult<usize>> {
         if (cancelled_->load()) co_return Err(WebSocketError::Cancelled);
@@ -88,10 +105,11 @@ public:
     static auto accept(Connection&            http,
                        const ServerHandshake& handshake,
                        WebSocketOptions       options    = {},
-                       rstd::time::Duration   io_timeout = rstd::time::Duration::from_secs(u64(30)))
+                       rstd::time::Duration   io_timeout = rstd::time::Duration::from_secs(u64(30)),
+                       Option<rstd::time::Duration> idle_timeout = {})
         -> coro<Result<ServerConnection, ServerConnectFailure>> {
-        if (io_timeout.is_zero() || options.receive_messages == usize() ||
-            options.receive_bytes == usize())
+        if (io_timeout.is_zero() || (idle_timeout.is_some() && idle_timeout->is_zero()) ||
+            options.receive_messages == usize() || options.receive_bytes == usize())
             co_return Err(ServerConnectFailure { .connection = Some(WebSocketError::Protocol) });
         auto prepared = http.prepare_upgrade(
             lihttpto::UpgradeProtocol::make("websocket"_str).unwrap(), handshake.headers());
@@ -101,7 +119,7 @@ public:
         if (upgraded.is_err())
             co_return Err(
                 ServerConnectFailure { .upgrade = Some(rstd::move(upgraded).unwrap_err()) });
-        auto wire = TcpTransport::make(rstd::move(upgraded).unwrap(), io_timeout);
+        auto wire = TcpTransport::make(rstd::move(upgraded).unwrap(), io_timeout, idle_timeout);
         if (wire.is_err())
             co_return Err(ServerConnectFailure { .connection = Some(wire.unwrap_err()) });
         auto driver = Driver::start(
@@ -114,20 +132,22 @@ public:
 } // namespace liserveto
 
 struct UpgradedTransport {
-    liserveto::UpgradedStream stream;
-    liserveto::Shutdown       cancelled;
-    rstd::time::Duration      timeout;
-    auto                      read() -> coro<WebSocketResult<Bytes>> {
+    liserveto::UpgradedStream    stream;
+    liserveto::Shutdown          cancelled;
+    rstd::time::Duration         timeout;
+    Option<rstd::time::Duration> idle_timeout;
+    auto                         read() -> coro<WebSocketResult<Bytes>> {
         if (cancelled.requested()) co_return Err(WebSocketError::Cancelled);
-        auto bytes  = BytesMut::with_capacity(usize(16384));
-        auto result = co_await rstd::async::timeout(
-            rstd::async::select(cancelled.notified(), rstd::async::io::read(stream, bytes)),
-            timeout);
-        if (result.is_err()) co_return Err(WebSocketError::Timeout);
-        auto selected = rstd::move(result).unwrap();
-        if (selected.is_left()) co_return Err(WebSocketError::Cancelled);
-        if (rstd::move(selected).unwrap_right().is_err()) co_return Err(WebSocketError::Transport);
-        co_return Ok(bytes.freeze());
+        auto reading = [&]() -> coro<WebSocketResult<Bytes>> {
+            auto bytes    = BytesMut::with_capacity(usize(16384));
+            auto selected = co_await rstd::async::select(cancelled.notified(),
+                                                         rstd::async::io::read(stream, bytes));
+            if (selected.is_left()) co_return Err(WebSocketError::Cancelled);
+            if (rstd::move(selected).unwrap_right().is_err())
+                co_return Err(WebSocketError::Transport);
+            co_return Ok(bytes.freeze());
+        };
+        co_return co_await websocket_read_with_timeout(reading(), idle_timeout);
     }
     auto write(Bytes bytes) -> coro<WebSocketResult<usize>> {
         if (cancelled.requested()) co_return Err(WebSocketError::Cancelled);
@@ -184,21 +204,24 @@ public:
                                    request.lifetime.clone()));
     }
     template<class H>
-    auto accept(H                    handler,
-                WebSocketOptions     options    = {},
-                rstd::time::Duration io_timeout = rstd::time::Duration::from_secs(
-                    u64(30))) && -> Result<Response, HandshakeError> {
-        if (io_timeout.is_zero() || options.receive_messages == usize() ||
-            options.receive_bytes == usize())
+    // Idle reads are unbounded unless explicitly configured; writes retain their deadline.
+    auto
+    accept(H                            handler,
+           WebSocketOptions             options      = {},
+           rstd::time::Duration         io_timeout   = rstd::time::Duration::from_secs(u64(30)),
+           Option<rstd::time::Duration> idle_timeout = {}) && -> Result<Response, HandshakeError> {
+        if (io_timeout.is_zero() || (idle_timeout.is_some() && idle_timeout->is_zero()) ||
+            options.receive_messages == usize() || options.receive_bytes == usize())
             return Err(HandshakeError::Upgrade());
         struct Action {
-            H                    handler;
-            WebSocketOptions     options;
-            rstd::time::Duration io_timeout;
-            ServerHandshake      handshake;
-            Shutdown             shutdown;
-            RequestLifetime      lifetime;
-            auto                 validate_response(const lihttpto::ResponseHead& head) const
+            H                            handler;
+            WebSocketOptions             options;
+            rstd::time::Duration         io_timeout;
+            Option<rstd::time::Duration> idle_timeout;
+            ServerHandshake              handshake;
+            Shutdown                     shutdown;
+            RequestLifetime              lifetime;
+            auto                         validate_response(const lihttpto::ResponseHead& head) const
                 -> Result<empty, BodyError> {
                 if (handshake.validate_response_headers(head.headers).is_err())
                     return Err(BodyError::Protocol);
@@ -207,7 +230,8 @@ public:
             auto operator()(UpgradedStream stream, rstd::sync::Arc<ConnectionCleanup> cleanup)
                 -> coro<Result<empty, BodyError>> {
                 auto driver = WebSocketConnection<UpgradedTransport>::start(
-                    UpgradedTransport { rstd::move(stream), Shutdown::make().unwrap(), io_timeout },
+                    UpgradedTransport {
+                        rstd::move(stream), Shutdown::make().unwrap(), io_timeout, idle_timeout },
                     Role::Server,
                     options,
                     handshake.protocol().clone());
@@ -236,8 +260,9 @@ public:
             }
         };
         auto headers = handshake_.headers().clone();
-        auto action  = Action { rstd::move(handler),    options,           io_timeout,
-                                rstd::move(handshake_), shutdown_.clone(), lifetime_.clone() };
+        auto action =
+            Action { rstd::move(handler),    options,           io_timeout,       idle_timeout,
+                     rstd::move(handshake_), shutdown_.clone(), lifetime_.clone() };
         auto response =
             Response::on_upgrade(rstd::move(permit_),
                                  lihttpto::UpgradeProtocol::make("websocket"_str).unwrap(),

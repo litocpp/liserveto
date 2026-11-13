@@ -39,8 +39,10 @@ struct EndpointSocket {
     }
 };
 
-auto managed_endpoint_socket(bool force, bool embedded = false, bool delayed_cleanup = false)
-    -> coro<bool> {
+auto managed_endpoint_socket(bool force,
+                             bool embedded        = false,
+                             bool delayed_cleanup = false,
+                             bool idle_pause      = false) -> coro<bool> {
     auto listener =
         rstd::net::TcpListener::bind(rstd::net::SocketAddr::ipv4_loopback(u16())).unwrap();
     auto                    address         = listener.local_addr().unwrap();
@@ -96,7 +98,10 @@ auto managed_endpoint_socket(bool force, bool embedded = false, bool delayed_cle
                              co_await handler_release.notified();
                          }
                          co_return Ok(empty {});
-                     });
+                     },
+                     {},
+                     idle_pause ? rstd::time::Duration::from_millis(u64(10))
+                                : rstd::time::Duration::from_secs(u64(30)));
                  if (response.is_err())
                      co_return Err(liserveto::Error { ErrorKind::InvalidRequest });
                  response->head.headers.add("X-Final"_str, "yes"_str).unwrap();
@@ -140,7 +145,7 @@ auto managed_endpoint_socket(bool force, bool embedded = false, bool delayed_cle
     BytesMut input;
     input.put_slice("GET /api HTTP/1.1\r\nHost: x\r\n\r\n"_str.as_bytes());
     input.put_slice(handshake.request().bytes().as_slice());
-    if (! force) input.put_slice(text.bytes.as_slice());
+    if (! force && ! idle_pause) input.put_slice(text.bytes.as_slice());
     if ((co_await rstd::async::io::write_all(client, input.freeze())).is_err()) co_return false;
     session.written(text.ticket).unwrap();
     auto api    = "HTTP/1.1 200 \r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"_str;
@@ -167,6 +172,13 @@ auto managed_endpoint_socket(bool force, bool embedded = false, bool delayed_cle
         break;
     }
     if (! force) {
+        if (idle_pause) {
+            co_await rstd::async::sleep(rstd::time::Duration::from_millis(u64(50)));
+            EXPECT_EQ(dropped, 0);
+            EXPECT_TRUE(lifetime->report().is_none());
+            if (dropped != 0 || lifetime->report().is_some()) co_return false;
+            if ((co_await rstd::async::io::write_all(client, text.bytes)).is_err()) co_return false;
+        }
         bool closed = false;
         bool echoed = false;
         while (! closed) {
@@ -246,6 +258,14 @@ TEST(WebSocketEndpoint, SharesApiRouterAndPreservesFirstFrameAfterKeepAlive) {
     auto result  = runtime.block_on(
         rstd::async::timeout(rstd::async::into_future(managed_endpoint_socket(false)),
                              rstd::time::Duration::from_secs(u64(2))));
+    ASSERT_TRUE(result.is_ok());
+    EXPECT_TRUE(*result);
+}
+TEST(WebSocketEndpoint, IdleReadOutlivesWriteDeadlineThenExchangesFrames) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto result  = runtime.block_on(rstd::async::timeout(
+        rstd::async::into_future(managed_endpoint_socket(false, false, false, true)),
+        rstd::time::Duration::from_secs(u64(2))));
     ASSERT_TRUE(result.is_ok());
     EXPECT_TRUE(*result);
 }

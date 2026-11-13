@@ -147,4 +147,43 @@ TEST(Roundtrip, AuthenticatedUpgradeTextPingAndClose) {
     ASSERT_TRUE(result.is_ok() && result->is_ok());
     EXPECT_TRUE(**result);
 }
+
+static auto transport_idle_read(bool expire) -> coro<bool> {
+    auto listener =
+        rstd::net::TcpListener::bind(rstd::net::SocketAddr::ipv4_loopback(u16())).unwrap();
+    auto client = (co_await rstd::net::TcpStream::connect(listener.local_addr().unwrap())).unwrap();
+    auto accepted = (co_await listener.accept()).unwrap();
+    auto idle =
+        expire ? Some(rstd::time::Duration::from_millis(u64(10))) : Option<rstd::time::Duration> {};
+    auto transport = TcpTransport::make(UpgradedConnection { rstd::move(accepted.get<0>()), {} },
+                                        rstd::time::Duration::from_millis(u64(5)),
+                                        idle)
+                         .unwrap();
+    auto reading   = rstd::async::into_future(transport.read());
+    auto waited    = co_await rstd::async::timeout(rstd::future::by_ref(reading),
+                                                   rstd::time::Duration::from_millis(u64(50)));
+    if (expire)
+        co_return waited.is_ok() && waited->is_err() &&
+            waited->unwrap_err() == WebSocketError::Timeout;
+    if (waited.is_ok()) co_return false;
+    transport.cancel();
+    auto result = co_await rstd::future::by_ref(reading);
+    co_return result.is_err() && result.unwrap_err() == WebSocketError::Cancelled;
+}
+TEST(WebSocketTransport, ExplicitIdleTimeoutExpiresRead) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto result =
+        runtime.block_on(rstd::async::timeout(rstd::async::into_future(transport_idle_read(true)),
+                                              rstd::time::Duration::from_secs(u64(2))));
+    ASSERT_TRUE(result.is_ok());
+    EXPECT_TRUE(*result);
+}
+TEST(WebSocketTransport, DefaultIdleReadRemainsCancellableAfterWriteDeadline) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto result =
+        runtime.block_on(rstd::async::timeout(rstd::async::into_future(transport_idle_read(false)),
+                                              rstd::time::Duration::from_secs(u64(2))));
+    ASSERT_TRUE(result.is_ok());
+    EXPECT_TRUE(*result);
+}
 #endif
