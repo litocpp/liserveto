@@ -1,0 +1,11 @@
+<release version="0.1.1" date="2026-11-17">
+  <description>
+    <ul>
+      <li>Add ResourceBundle support to StaticFiles.</li>
+      <li>Add ParseOptions to read_json and error traits for BodyError.</li>
+      <li>Fix WebSocket upgrade error construction and separate idle and write timeouts.</li>
+    </ul>
+  </description>
+</release>
+<release version="0.1.0" date="2026-10-20">
+</release>
