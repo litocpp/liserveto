@@ -1,3 +1,10 @@
+<release version="0.1.2" date="2026-11-18">
+  <description>
+    <ul>
+      <li>Move WebSocket transport and upgrade handling out of module interfaces.</li>
+    </ul>
+  </description>
+</release>
 <release version="0.1.1" date="2026-11-17">
   <description>
     <ul>
